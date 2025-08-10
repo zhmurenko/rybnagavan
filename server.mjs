@@ -1,4 +1,4 @@
-// server.mjs — Telegram бот для бронювання з календарем дат (Admin API Key)
+// server.mjs — Telegram-бот бронирования с календарём дат (Wix Admin API Key)
 
 import 'dotenv/config';
 import express from 'express';
@@ -6,33 +6,33 @@ import { Telegraf, Markup } from 'telegraf';
 import { createClient, ApiKeyStrategy } from '@wix/sdk';
 import { services as servicesApi, bookings as bookingsApi } from '@wix/bookings';
 
-// ================== ENV sanity ==================
-const REQ_ENV = ['BOT_TOKEN', 'ADMIN_API_KEY', 'SITE_ID', 'PUBLIC_URL'];
-REQ_ENV.forEach(k => { if (!process.env[k]) console.error(`ENV ${k} is missing`); });
+// ------------ ENV ------------
+const MUST = ['BOT_TOKEN', 'ADMIN_API_KEY', 'SITE_ID', 'PUBLIC_URL'];
+MUST.forEach(k => { if (!process.env[k]) console.error(`ENV ${k} is missing`); });
 
-const BOT_TOKEN    = process.env.BOT_TOKEN;
-const ADMIN_API_KEY= process.env.ADMIN_API_KEY;
-const SITE_ID      = process.env.SITE_ID;
-const PUBLIC_URL   = process.env.PUBLIC_URL;
-const TIMEZONE     = process.env.TIMEZONE || 'Europe/Kyiv';
+const BOT_TOKEN     = process.env.BOT_TOKEN;
+const ADMIN_API_KEY = process.env.ADMIN_API_KEY;
+const SITE_ID       = process.env.SITE_ID;
+const PUBLIC_URL    = process.env.PUBLIC_URL;
+const PORT          = process.env.PORT || 3000;
 
 const app = express();
 app.use(express.json());
 
-// ================== Wix client (Admin API Key) ==================
+// ------------ Wix SDK (Admin API Key) ------------
 const wix = createClient({
   modules: { services: servicesApi, bookings: bookingsApi },
   auth: ApiKeyStrategy({ siteId: SITE_ID, apiKey: ADMIN_API_KEY }),
 });
 
-// ================== REST helpers (services/availability) ==================
+// ------------ REST helpers (services / availability) ------------
 const baseHeaders = {
   'Content-Type': 'application/json',
   Authorization: ADMIN_API_KEY,
   'wix-site-id': SITE_ID,
 };
 
-// Services — SDK → REST fallback
+// Сервисы: REST (fallback к SDK ниже)
 async function restQueryServices() {
   const r = await fetch('https://www.wixapis.com/bookings/v1/services/query', {
     method: 'POST',
@@ -43,26 +43,20 @@ async function restQueryServices() {
   return r.json(); // { services: [...] }
 }
 
-// !!! FIXED: startDate/endDate у filter
+// Доступность: ВАЖНО — filter: { serviceId, startDate, endDate } (UTC ISO)
 async function restQueryAvailability({ serviceId, startDate, endDate }) {
   const r = await fetch('https://www.wixapis.com/bookings/v1/availability/query', {
     method: 'POST',
     headers: baseHeaders,
     body: JSON.stringify({
-      query: {
-        filter: {
-          serviceId,
-          startDate,
-          endDate,
-          timeZone: TIMEZONE, // деякі інсталяції очікують у filter
-        },
-      },
+      query: { filter: { serviceId, startDate, endDate } },
     }),
   });
   if (!r.ok) throw new Error(`availability ${r.status}: ${await r.text()}`);
-  return r.json(); // { slots: [...] } (або availability.slots)
+  return r.json(); // { slots: [...] } или { availability: { slots: [...] } }
 }
 
+// Унифицированный геттер услуг (сначала SDK, затем REST)
 async function getServices() {
   try {
     const resp = await wix.services.queryServices().find();
@@ -73,32 +67,33 @@ async function getServices() {
   }
 }
 
-// ================== ДАТИ/ФОРМАТИ ==================
+// ------------ утилиты дат ------------
 const RU_DAYS = ['Нд', 'Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб'];
 const UA_MONTHS_SHORT = ['січ', 'лют', 'бер', 'квіт', 'трав', 'черв', 'лип', 'сер', 'вер', 'жовт', 'лис', 'груд'];
+const pad2 = n => String(n).padStart(2, '0');
 
-function pad2(n) { return n.toString().padStart(2, '0'); }
-function toYMD(d) { return `${d.getUTCFullYear()}-${pad2(d.getUTCMonth() + 1)}-${pad2(d.getUTCDate())}`; }
+function toYMD(d) {
+  return `${d.getUTCFullYear()}-${pad2(d.getUTCMonth() + 1)}-${pad2(d.getUTCDate())}`;
+}
 function dayLabel(d, todayYMD) {
   const ymd = toYMD(d);
   if (ymd === todayYMD) return 'Сьогодні';
-  const wd = RU_DAYS[d.getUTCDay()];
-  return `${wd} ${d.getUTCDate()} ${UA_MONTHS_SHORT[d.getUTCMonth()]}`;
+  return `${RU_DAYS[d.getUTCDay()]} ${d.getUTCDate()} ${UA_MONTHS_SHORT[d.getUTCMonth()]}`;
 }
-function startOfUTC(ymd) { return new Date(`${ymd}T00:00:00.000Z`); }
-function endOfUTC(ymd)   { return new Date(`${ymd}T23:59:59.999Z`); }
+const startOfUTC = ymd => new Date(`${ymd}T00:00:00.000Z`);
+const endOfUTC   = ymd => new Date(`${ymd}T23:59:59.999Z`);
 
-// ================== Telegram bot ==================
+// ------------ Telegram bot ------------
 const bot = new Telegraf(BOT_TOKEN);
 
-// Прості “сесії” в памʼяті процеса
-const sessions = new Map(); // userId => { serviceId, dateYMD, slotId, step, name, phone }
+// простые «сессии» в памяти процесса
+const sessions = new Map(); // userId -> { serviceId, dateYMD, slotId, step, name, phone }
 
-bot.start((ctx) =>
+bot.start(ctx =>
   ctx.reply('Привіт! Оберіть дію:', Markup.keyboard([['🗂 Послуги']]).resize())
 );
 
-// Послуги -> інлайн кнопки
+// список услуг
 bot.hears('🗂 Послуги', async (ctx) => {
   try {
     const services = await getServices();
@@ -116,7 +111,7 @@ bot.hears('🗂 Послуги', async (ctx) => {
   }
 });
 
-// Обрали послугу — календар на 7 днів
+// выбор даты (7 дней)
 bot.action(/^svc:(.+)$/, async (ctx) => {
   try {
     const serviceId = ctx.match[1];
@@ -124,11 +119,9 @@ bot.action(/^svc:(.+)$/, async (ctx) => {
 
     const today = new Date();
     const todayYMD = toYMD(today);
-
     const days = [...Array(7)].map((_, i) => {
       const d = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate() + i));
-      const ymd = toYMD(d);
-      return { ymd, label: dayLabel(d, todayYMD) };
+      return { ymd: toYMD(d), label: dayLabel(d, todayYMD) };
     });
 
     const rows = [];
@@ -145,11 +138,10 @@ bot.action(/^svc:(.+)$/, async (ctx) => {
 });
 
 bot.action('back:services', async (ctx) => {
-  // повернення до списку послуг
   return bot.hears.handlers.get('🗂 Послуги')[0](ctx);
 });
 
-// Обрали день — тягнемо слоти
+// загрузка слотов выбранного дня
 bot.action(/^day:(.+):(\d{4}-\d{2}-\d{2})$/, async (ctx) => {
   try {
     const serviceId = ctx.match[1];
@@ -169,8 +161,8 @@ bot.action(/^day:(.+):(\d{4}-\d{2}-\d{2})$/, async (ctx) => {
     }
 
     const btns = slots.slice(0, 12).map(s => {
-      const start = (s.startTime || s.slot?.startTime || '').slice(11, 16);
-      const end   = (s.endTime   || s.slot?.endTime   || '').slice(11, 16);
+      const start  = (s.startTime || s.slot?.startTime || '').slice(11, 16);
+      const end    = (s.endTime   || s.slot?.endTime   || '').slice(11, 16);
       const slotId = s.slot?.id || s.id || s.slotId;
       return [Markup.button.callback(`${start} → ${end}`, `pick:${serviceId}:${ymd}:${slotId}`)];
     });
@@ -183,7 +175,7 @@ bot.action(/^day:(.+):(\d{4}-\d{2}-\d{2})$/, async (ctx) => {
   }
 });
 
-// Обрали слот — імʼя -> телефон -> бронь
+// выбор слота -> сбор имени/телефона -> createBooking
 bot.action(/^pick:(.+):(\d{4}-\d{2}-\d{2}):(.+)$/, async (ctx) => {
   try {
     const [_, serviceId, ymd, slotId] = ctx.match;
@@ -211,7 +203,7 @@ bot.on('text', async (ctx) => {
       const phone = ctx.message.text.trim();
       if (!/^\+?\d{10,15}$/.test(phone)) {
         return ctx.reply('Телефон має бути у форматі +380XXXXXXXXX (10–15 цифр).');
-      }
+        }
       s.phone = phone;
 
       const r = await wix.bookings.createBooking({
@@ -233,9 +225,9 @@ bot.on('text', async (ctx) => {
   }
 });
 
-// ================== HTTP (діагностика) ==================
-app.get('/', (_, res) => res.send('ok — /health, /debug/services'));
-app.get('/health', (_, res) => res.send('ok'));
+// ------------ HTTP (health/debug) ------------
+app.get('/',        (_, res) => res.send('ok — /health, /debug/services'));
+app.get('/health',  (_, res) => res.send('ok'));
 app.get('/debug/services', async (_, res) => {
   try {
     const items = await getServices();
@@ -245,10 +237,10 @@ app.get('/debug/services', async (_, res) => {
   }
 });
 
+// webhook для Telegram
 app.use(bot.webhookCallback(`/tg/${BOT_TOKEN}`));
 
-// ================== START ==================
-const PORT = process.env.PORT || 3000;
+// ------------ START ------------
 app.listen(PORT, async () => {
   try {
     const url = `${PUBLIC_URL}/tg/${BOT_TOKEN}`;
