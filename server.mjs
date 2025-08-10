@@ -7,14 +7,33 @@ import { bookings } from '@wix/bookings';
 const app = express();
 app.use(express.json());
 
+// ---- валидация переменных окружения (чтобы сразу видно было в логах) ----
+['BOT_TOKEN', 'CLIENT_ID', 'CLIENT_SECRET', 'PUBLIC_URL'].forEach((k) => {
+  if (!process.env[k]) {
+    console.error(`ENV ${k} is missing`);
+  }
+});
+
 // ---- Wix SDK (OAuth: client_credentials) ----
 const wix = createClient({
   modules: { bookings },
   auth: OAuthStrategy({
     clientId: process.env.CLIENT_ID,
-    clientSecret: process.env.CLIENT_SECRET, // обязателен для server-to-server
+    clientSecret: process.env.CLIENT_SECRET,
   }),
 });
+
+// ВАЖНО: задать сайт, чтобы Bookings знал, куда лезть
+if (process.env.SITE_ID) {
+  try {
+    wix.setSite({ siteId: process.env.SITE_ID });
+    console.log('Wix site set:', process.env.SITE_ID);
+  } catch (e) {
+    console.error('setSite error:', e);
+  }
+} else {
+  console.warn('ENV SITE_ID is missing — services/availability may fail');
+}
 
 // ---- Telegram Bot ----
 const bot = new Telegraf(process.env.BOT_TOKEN);
@@ -27,12 +46,13 @@ bot.start((ctx) =>
   )
 );
 
-// список услуг
+// список послуг
 bot.hears('🗂 Послуги', async (ctx) => {
   try {
     const resp = await wix.bookings.services.queryServices().find();
-    if (!resp.items.length) return ctx.reply('Послуг поки немає.');
-    const rows = resp.items.map(s => `• ${s.info?.name} — ${s._id}`).join('\n');
+    const items = resp?.items || [];
+    if (!items.length) return ctx.reply('Послуг поки немає.');
+    const rows = items.map(s => `• ${s.info?.name} — ${s._id}`).join('\n');
     ctx.reply(`Доступні послуги:\n${rows}\n\nНадішли /slots <SERVICE_ID> щоб побачити вільні слоти на сьогодні.`);
   } catch (e) {
     console.error('services error:', e?.response?.data || e);
@@ -47,7 +67,8 @@ bot.command('slots', async (ctx) => {
     if (!serviceId) return ctx.reply('Надішли: /slots <SERVICE_ID>');
 
     const from = new Date();
-    const to = new Date(Date.now() + 24*60*60*1000);
+    const to = new Date(Date.now() + 24 * 60 * 60 * 1000);
+
     const resp = await wix.bookings.availability.queryAvailability({
       query: { serviceId, from: from.toISOString(), to: to.toISOString() }
     });
@@ -55,9 +76,8 @@ bot.command('slots', async (ctx) => {
     const slots = resp?.slots || [];
     if (!slots.length) return ctx.reply('Немає доступних слотів на обраний період.');
 
-    // первые 6 слотов кнопками
     const btns = slots.slice(0, 6).map(s => {
-      const label = s.startTime.slice(11,16) + ' → ' + s.endTime.slice(11,16);
+      const label = s.startTime.slice(11, 16) + ' → ' + s.endTime.slice(11, 16);
       return [Markup.button.callback(label, `pick:${serviceId}:${s.slot.id}`)];
     });
     ctx.reply('Оберіть слот:', Markup.inlineKeyboard(btns));
@@ -67,8 +87,8 @@ bot.command('slots', async (ctx) => {
   }
 });
 
-// выбор слота -> просим телефон -> создаём бронь
-const sessions = new Map(); // простая память процесса (для прод — лучше Redis)
+// примитивные сессии в памяти процесса
+const sessions = new Map();
 
 bot.action(/pick:(.+):(.+)/, async (ctx) => {
   const [, serviceId, slotId] = ctx.match;
@@ -79,7 +99,7 @@ bot.action(/pick:(.+):(.+)/, async (ctx) => {
 
 bot.on('text', async (ctx) => {
   const s = sessions.get(ctx.from.id);
-  if (!s?.slotId) return; // не ждём телефон — игнор
+  if (!s?.slotId) return; // ждём телефон? если нет — выходим
 
   const phone = ctx.message.text.trim();
   if (!/^\+?\d{10,15}$/.test(phone)) return ctx.reply('Схоже, це не номер. Надішли номер у форматі +380...');
@@ -101,20 +121,12 @@ bot.on('text', async (ctx) => {
   }
 });
 
-// webhook (Render/Railway)
+// --- HTTP роуты ---
+app.get('/', (_, res) => res.send('ok — bot webhook is /tg/<BOT_TOKEN>, health is /health'));
+app.get('/health', (_, res) => res.send('ok'));
 app.use(bot.webhookCallback(`/tg/${process.env.BOT_TOKEN}`));
 
-// healthcheck
-app.get('/health', (_, res) => res.send('ok'));
-
-// graceful shutdown
-function shutdown(sig) {
-  console.log(`\n${sig} received, shutting down...`);
-  process.exit(0);
-}
-['SIGINT','SIGTERM'].forEach(sig => process.on(sig, () => shutdown(sig)));
-
-// запуск и установка вебхука
+// --- запуск и установка вебхука ---
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
   try {
@@ -122,7 +134,7 @@ app.listen(PORT, async () => {
     await bot.telegram.setWebhook(url);
     console.log('Webhook set to', url);
   } catch (e) {
-    console.error('Webhook set error:', e);
+    console.error('Webhook set error:', e?.response?.data || e);
   }
   console.log('Server listening on', PORT);
 });
