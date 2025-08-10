@@ -8,11 +8,11 @@ dotenv.config();
 const app = express();
 app.use(express.json());
 
-const TOKEN  = process.env.BOT_TOKEN;   // токен Telegram-бота
-const CHAT   = process.env.CHAT_ID;     // ID чату/каналу
-const TZ     = 'Europe/Kiev';
+const TOKEN = process.env.BOT_TOKEN;   // токен Telegram-бота
+const CHAT  = process.env.CHAT_ID;     // ID чату/каналу
+const TZ    = 'Europe/Kiev';           // часова зона для форматування дат
 
-// Невелика утиліта для екранування Markdown V2 (щоб не ламались спецсимволи)
+// Екранування під MarkdownV2
 function md(text = '') {
   return String(text).replace(/[_*[\]()~`>#+\-=|{}.!]/g, '\\$&');
 }
@@ -29,16 +29,16 @@ async function send(text) {
     body: JSON.stringify({
       chat_id: CHAT,
       text,
-      parse_mode: 'MarkdownV2', // надійніше, якщо все екранувати
+      parse_mode: 'MarkdownV2',
       disable_web_page_preview: true
     })
   });
 }
 
-// Проста «живу» перевірка
+// Проста перевірка живості
 app.get('/', (_req, res) => res.send('OK'));
 
-// Вебхук від Wix
+// Вебхук від Wix — шлемо сповіщення в Telegram
 app.post('/booking', async (req, res) => {
   try {
     const data = req.body?.data;
@@ -47,16 +47,27 @@ app.post('/booking', async (req, res) => {
       return res.json({ ok: true });
     }
 
-    // Поля з твого реального JSON
+    // Поля з реального JSON від Wix
+    const service   = data.service_name_main_language || data.service_name || '';
     const sector    = data.staff_member_name || data.staff_member_name_main_language || '';
     const start     = fmtDate(data.start_date_by_business_tz || data.start_date);
     const end       = fmtDate(data.end_date);
-    const amount    = data.amount_due || (data.price?.value && data.price?.currency ? `${data.price.value} ${data.price.currency}` : '');
-    const service   = data.service_name_main_language || data.service_name || '';
-    const orderNo   = data.order_number || '';
-    const bookingId = data.booking_id || '';
-    const name      = `${data.contact?.name?.first || ''} ${data.contact?.name?.last || ''}`.trim();
-    const phone     = data.contact?.phones?.[0]?.e164Phone || data.booking_contact_phone || '';
+
+    // Сума замовлення (загальна)
+    const totalVal  = data.price?.value || data.amount_due || null;
+    const currency  = data.price?.currency || data.remaining_amount_due?.currency || data.currency || 'UAH';
+    const amountTotal = totalVal ? `${totalVal} ${currency}` : '';
+
+    // Залишок до оплати: якщо є remaining_amount_due — використовуємо його, інакше 0
+    const remainingVal = data.remaining_amount_due?.value;
+    const remainingCur = data.remaining_amount_due?.currency || currency;
+    const amountDue = (remainingVal !== undefined && remainingVal !== null)
+      ? `${remainingVal} ${remainingCur}`
+      : `0 ${currency}`;
+
+    const name    = `${data.contact?.name?.first || ''} ${data.contact?.name?.last || ''}`.trim();
+    const phone   = data.contact?.phones?.[0]?.e164Phone || data.booking_contact_phone || '';
+    const orderNo = data.order_number || '';
 
     const lines = [
       `📢 *Нове бронювання*`,
@@ -65,12 +76,12 @@ app.post('/booking', async (req, res) => {
       sector  ? `🏝 Сектор: *${md(sector)}*` : null,
       `📅 Початок: *${md(start)}*`,
       `🏁 Кінець: *${md(end)}*`,
-      amount  ? `💰 Сума: *${md(amount)}*` : null,
+      amountTotal ? `💰 Сума замовлення: *${md(amountTotal)}*` : null,
+      `💳 Залишок до оплати: *${md(amountDue)}*`,
       ``,
       name    ? `👤 Клієнт: *${md(name)}*` : null,
       phone   ? `📞 Телефон: ${md(phone)}` : null,
-      orderNo ? `🧾 Замовлення: *${md(orderNo)}*` : null,
-      bookingId ? `🔖 ID броні: \`${md(bookingId)}\`` : null
+      orderNo ? `🧾 Номер замовлення: *${md(orderNo)}*` : null
     ].filter(Boolean).join('\n');
 
     await send(lines);
