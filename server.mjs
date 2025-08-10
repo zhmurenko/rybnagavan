@@ -11,6 +11,7 @@ const TOKEN = process.env.BOT_TOKEN;
 const CHAT_ID = process.env.CHAT_ID;
 const WIX_API_KEY = process.env.WIX_API_KEY;
 const SECRET_TOKEN = process.env.SECRET_TOKEN;
+const WIX_SITE_ID = process.env.WIX_SITE_ID;
 
 async function sendToTelegram(text, buttons = null) {
   const body = {
@@ -21,13 +22,11 @@ async function sendToTelegram(text, buttons = null) {
   if (buttons) {
     body.reply_markup = { inline_keyboard: buttons };
   }
-
   const res = await fetch(`https://api.telegram.org/bot${TOKEN}/sendMessage`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body)
   });
-
   return res.json();
 }
 
@@ -52,7 +51,6 @@ function formatDate(dateString) {
 app.post('/booking', async (req, res) => {
   try {
     const data = req.body.data;
-
     if (data) {
       const sector = data.staff_member_name || '-';
       const startDate = formatDate(data.start_date_by_business_tz);
@@ -91,7 +89,6 @@ app.post('/booking', async (req, res) => {
     } else {
       await sendToTelegram(`⚠️ Неожиданные данные:\n\`\`\`json\n${JSON.stringify(req.body, null, 2)}\n\`\`\``);
     }
-
     res.json({ ok: true });
   } catch (err) {
     console.error('Ошибка при обработке вебхука:', err);
@@ -99,42 +96,51 @@ app.post('/booking', async (req, res) => {
   }
 });
 
-// ✅ Маршрут для изменения статуса с красивой HTML-страницей
+// ✅ Новый маршрут для смены статуса в Wix
 app.get('/change-status/:bookingId', async (req, res) => {
   try {
     const { bookingId } = req.params;
     const { token, msg_id, status } = req.query;
-
     if (token !== SECRET_TOKEN) {
       return res.status(403).send('<h2 style="color:red;">❌ Доступ запрещён</h2>');
     }
 
-    // Обновляем статус в Wix
-    const wixRes = await fetch(`https://www.wixapis.com/bookings/v1/bookings/${bookingId}`, {
-      method: 'PATCH',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': WIX_API_KEY
-      },
-      body: JSON.stringify({ paymentStatus: status })
-    });
+    const wixHeaders = {
+      'Content-Type': 'application/json',
+      'Authorization': WIX_API_KEY,
+      'wix-site-id': WIX_SITE_ID
+    };
 
-    if (!wixRes.ok) {
-      const errorText = await wixRes.text();
-      console.error('Ошибка Wix API:', errorText);
+    let ok = false;
+    let pageMessage = '';
+
+    if (status === 'PAID') {
+      const r = await fetch(`https://www.wixapis.com/bookings/v2/confirmation/${bookingId}:confirmOrDecline`, {
+        method: 'POST',
+        headers: wixHeaders,
+        body: JSON.stringify({ paymentStatus: 'PAID' })
+      });
+      ok = r.ok;
+      pageMessage = '💰 Оплата успешно подтверждена';
+    } else if (status === 'CANCELLED') {
+      const r = await fetch(`https://www.wixapis.com/_api/bookings-service/v2/bookings/${bookingId}/cancel`, {
+        method: 'POST',
+        headers: wixHeaders
+      });
+      ok = r.ok;
+      pageMessage = '🚫 Бронь отменена (клиент не приехал)';
+    } else {
+      return res.status(400).send('<h2 style="color:red;">❌ Неизвестный статус</h2>');
+    }
+
+    if (!ok) {
       return res.status(500).send('<h2 style="color:red;">❌ Ошибка при обновлении статуса в Wix</h2>');
     }
 
-    // Меняем кнопки в исходном сообщении
-    let newButtons;
-    let pageMessage;
-    if (status === 'PAID') {
-      newButtons = [[{ text: '✅ Оплачено' }]];
-      pageMessage = '💰 Оплата успешно подтверждена';
-    } else if (status === 'CANCELLED') {
-      newButtons = [[{ text: '❌ Не состоялась' }]];
-      pageMessage = '🚫 Бронь отменена (клиент не приехал)';
-    }
+    // Обновляем кнопки в Telegram
+    const newButtons = status === 'PAID'
+      ? [[{ text: '✅ Оплачено' }]]
+      : [[{ text: '❌ Не состоялась' }]];
     await editTelegramMessageMarkup(msg_id, newButtons);
 
     // Красивый HTML ответ
@@ -144,28 +150,9 @@ app.get('/change-status/:bookingId', async (req, res) => {
         <meta charset="utf-8">
         <title>Статус обновлён</title>
         <style>
-          body {
-            font-family: Arial, sans-serif;
-            text-align: center;
-            background-color: #f4f4f4;
-            padding-top: 50px;
-          }
-          .card {
-            display: inline-block;
-            padding: 20px 40px;
-            background: white;
-            border-radius: 12px;
-            box-shadow: 0 2px 8px rgba(0,0,0,0.2);
-          }
-          h1 {
-            color: ${status === 'PAID' ? 'green' : 'red'};
-          }
-          a {
-            display: inline-block;
-            margin-top: 20px;
-            text-decoration: none;
-            color: #007bff;
-          }
+          body { font-family: Arial, sans-serif; text-align: center; background-color: #f4f4f4; padding-top: 50px; }
+          .card { display: inline-block; padding: 20px 40px; background: white; border-radius: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.2); }
+          h1 { color: ${status === 'PAID' ? 'green' : 'red'}; }
         </style>
       </head>
       <body>
