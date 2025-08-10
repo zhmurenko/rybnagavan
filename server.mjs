@@ -8,18 +8,20 @@ dotenv.config();
 const app = express();
 app.use(express.json());
 
-const TOKEN       = process.env.BOT_TOKEN;
-const CHAT_ID     = process.env.CHAT_ID;
-const WIX_API_KEY = process.env.WIX_API_KEY;   // без "Bearer"
-const WIX_SITE_ID = process.env.WIX_SITE_ID;   // metasiteId из вебхука
-const SECRET_TOKEN= process.env.SECRET_TOKEN;
+const TOKEN        = process.env.BOT_TOKEN;
+const CHAT_ID      = process.env.CHAT_ID;
+const WIX_API_KEY  = process.env.WIX_API_KEY;   // без "Bearer"
+const WIX_SITE_ID  = process.env.WIX_SITE_ID;   // metasiteId из вебхука
+const SECRET_TOKEN = process.env.SECRET_TOKEN;
 
 async function sendToTelegram(text, buttons = null) {
   const body = { chat_id: CHAT_ID, text, parse_mode: 'Markdown' };
   if (buttons) body.reply_markup = { inline_keyboard: buttons };
 
   const res = await fetch(`https://api.telegram.org/bot${TOKEN}/sendMessage`, {
-    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
   });
   return res.json(); // нужен message_id
 }
@@ -28,7 +30,11 @@ async function editTelegramMessageMarkup(messageId, buttons) {
   await fetch(`https://api.telegram.org/bot${TOKEN}/editMessageReplyMarkup`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ chat_id: CHAT_ID, message_id: messageId, reply_markup: { inline_keyboard: buttons } })
+    body: JSON.stringify({
+      chat_id: CHAT_ID,
+      message_id: messageId,
+      reply_markup: { inline_keyboard: buttons }
+    })
   });
 }
 
@@ -101,62 +107,81 @@ app.get('/change-status/:bookingId', async (req, res) => {
       'wix-site-id' : WIX_SITE_ID
     };
 
-    let endpoint = '';
-    let body     = {};
-    let success  = '';
-
+    let successText = '';
     if (status === 'PAID') {
-      // подтверждение + отметка об оплате
-      endpoint = `https://www.wixapis.com/bookings/v2/confirmation/${bookingId}:confirmOrDecline`;
-      body     = { action: 'CONFIRM', paymentStatus: 'PAID' };
-      success  = '💰 Оплата успешно подтверждена';
+      // 1) подтверждаем бронь
+      const r1 = await fetch(`https://www.wixapis.com/bookings/v2/confirmation/${bookingId}:confirmOrDecline`, {
+        method: 'POST',
+        headers: wixHeaders,
+        body: JSON.stringify({ action: 'CONFIRM' })
+      });
+      if (!r1.ok) {
+        const t = await r1.text();
+        return res.status(502).send(renderErrorCard(t));
+      }
+
+      // 2) отмечаем как оплачено
+      const r2 = await fetch(`https://www.wixapis.com/bookings/v2/bookings/${bookingId}:markAsPaid`, {
+        method: 'POST',
+        headers: wixHeaders,
+        body: JSON.stringify({}) // тело не обязательно
+      });
+      if (!r2.ok) {
+        const t = await r2.text();
+        return res.status(502).send(renderErrorCard(t));
+      }
+
+      successText = '💰 Оплата успешно подтверждена';
     } else if (status === 'CANCELLED') {
-      // отмена брони (клиент не приехал)
-      endpoint = `https://www.wixapis.com/bookings/v2/bookings/${bookingId}:cancel`;
-      body     = {}; // тело не обязательно
-      success  = '🚫 Бронь отменена (клиент не приехал)';
+      // отмена брони
+      const r = await fetch(`https://www.wixapis.com/bookings/v2/bookings/${bookingId}:cancel`, {
+        method: 'POST',
+        headers: wixHeaders,
+        body: JSON.stringify({}) // можно пусто
+      });
+      if (!r.ok) {
+        const t = await r.text();
+        return res.status(502).send(renderErrorCard(t));
+      }
+      successText = '🚫 Бронь отменена (клиент не приехал)';
     } else {
       return res.status(400).send('<h2 style="color:red; font-family:sans-serif;">❌ Неизвестный статус</h2>');
     }
 
-    const r = await fetch(endpoint, {
-      method: 'POST',
-      headers: wixHeaders,
-      body: JSON.stringify(body)
-    });
-
-    if (!r.ok) {
-      const text = await r.text();
-      return res.status(502).send(
-        `<div style="font-family:sans-serif;padding:24px;background:#fff;border-radius:12px;max-width:780px;margin:40px auto;box-shadow:0 2px 8px rgba(0,0,0,.1)">
-           <h2 style="color:#c00;margin:0 0 12px">❌ Ошибка при обновлении статуса в Wix</h2>
-           <div style="white-space:pre-wrap;font-family:ui-monospace,Consolas,monospace;background:#f7f7f8;border:1px solid #eee;border-radius:8px;padding:12px;max-height:360px;overflow:auto">${text.replaceAll('<','&lt;')}</div>
-           <p style="color:#666">Проверь: <b>WIX_API_KEY</b> (Bookings.ReadWrite), <b>WIX_SITE_ID</b>, корректность <b>bookingId</b> и URL.</p>
-         </div>`
-      );
-    }
-
-    // обновляем кнопки в исходном сообщении — оставляем только выбранный статус
+    // Обновляем кнопки в исходном сообщении — оставляем только выбранный статус
     const newButtons = status === 'PAID'
       ? [[{ text: '✅ Оплачено' }]]
       : [[{ text: '❌ Не состоялась' }]];
     await editTelegramMessageMarkup(msg_id, newButtons);
 
-    // аккуратная страница-ответ
-    res.send(`
-      <html><head><meta charset="utf-8"><title>Статус обновлён</title>
-      <style>
-        body{font-family:Arial,sans-serif;text-align:center;background:#f4f4f4;padding-top:50px}
-        .card{display:inline-block;padding:20px 40px;background:#fff;border-radius:12px;box-shadow:0 2px 8px rgba(0,0,0,.1)}
-        h1{color:${status === 'PAID' ? 'green' : 'red'}}
-      </style></head>
-      <body><div class="card"><h1>${success}</h1><p>Можно закрыть эту страницу.</p></div></body></html>
-    `);
+    // Красивый HTML ответ
+    res.send(renderOkCard(successText, status === 'PAID'));
   } catch (e) {
     console.error('Ошибка /change-status:', e);
     res.status(500).send('<h2 style="color:red; font-family:sans-serif;">❌ Ошибка сервера</h2>');
   }
 });
+
+function renderErrorCard(text) {
+  const safe = (text || '').replaceAll('<','&lt;');
+  return `
+  <div style="font-family:sans-serif;padding:24px;background:#fff;border-radius:12px;max-width:780px;margin:40px auto;box-shadow:0 2px 8px rgba(0,0,0,.1)">
+    <h2 style="color:#c00;margin:0 0 12px">❌ Ошибка при обновлении статуса в Wix</h2>
+    <div style="white-space:pre-wrap;font-family:ui-monospace,Consolas,monospace;background:#f7f7f8;border:1px solid #eee;border-radius:8px;padding:12px;max-height:360px;overflow:auto">${safe}</div>
+    <p style="color:#666">Проверь: <b>WIX_API_KEY</b> (Bookings.ReadWrite), <b>WIX_SITE_ID</b>, корректность <b>bookingId</b> и URL.</p>
+  </div>`;
+}
+
+function renderOkCard(message, isPaid) {
+  return `
+  <html><head><meta charset="utf-8"><title>Статус обновлён</title>
+  <style>
+    body{font-family:Arial,sans-serif;text-align:center;background:#f4f4f4;padding-top:50px}
+    .card{display:inline-block;padding:20px 40px;background:#fff;border-radius:12px;box-shadow:0 2px 8px rgba(0,0,0,.1)}
+    h1{color:${isPaid ? 'green' : 'red'}}
+  </style></head>
+  <body><div class="card"><h1>${message}</h1><p>Можно закрыть эту страницу.</p></div></body></html>`;
+}
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
