@@ -1,4 +1,4 @@
-// server.mjs — Telegram-бот бронирования с календарём дат (Wix Admin API Key)
+// server.mjs — Telegram-бот бронирования (Wix Admin API Key) с поддержкой таймзоны Europe/Kiev и DST
 
 import 'dotenv/config';
 import express from 'express';
@@ -16,6 +16,9 @@ const SITE_ID       = process.env.SITE_ID;
 const PUBLIC_URL    = process.env.PUBLIC_URL;
 const PORT          = process.env.PORT || 3000;
 
+// Таймзона аккаунта (для человека): Europe/Kiev (Wix понимает именно Kiev)
+const TIMEZONE      = process.env.TIMEZONE || 'Europe/Kiev';
+
 const app = express();
 app.use(express.json());
 
@@ -32,7 +35,6 @@ const baseHeaders = {
   'wix-site-id': SITE_ID,
 };
 
-// Сервисы: REST (fallback к SDK ниже)
 async function restQueryServices() {
   const r = await fetch('https://www.wixapis.com/bookings/v1/services/query', {
     method: 'POST',
@@ -43,7 +45,10 @@ async function restQueryServices() {
   return r.json(); // { services: [...] }
 }
 
-// Доступность: ВАЖНО — filter: { serviceId, startDate, endDate } (UTC ISO)
+/**
+ * availability: filter.startDate/endDate — ISO с нужным смещением (+02:00 / +03:00).
+ * Никакого timeZone в фильтре НЕ передаём.
+ */
 async function restQueryAvailability({ serviceId, startDate, endDate }) {
   const r = await fetch('https://www.wixapis.com/bookings/v1/availability/query', {
     method: 'POST',
@@ -56,7 +61,7 @@ async function restQueryAvailability({ serviceId, startDate, endDate }) {
   return r.json(); // { slots: [...] } или { availability: { slots: [...] } }
 }
 
-// Унифицированный геттер услуг (сначала SDK, затем REST)
+// Унифицированный геттер услуг
 async function getServices() {
   try {
     const resp = await wix.services.queryServices().find();
@@ -80,13 +85,48 @@ function dayLabel(d, todayYMD) {
   if (ymd === todayYMD) return 'Сьогодні';
   return `${RU_DAYS[d.getUTCDay()]} ${d.getUTCDate()} ${UA_MONTHS_SHORT[d.getUTCMonth()]}`;
 }
-const startOfUTC = ymd => new Date(`${ymd}T00:00:00.000Z`);
-const endOfUTC   = ymd => new Date(`${ymd}T23:59:59.999Z`);
+
+/**
+ * DST для Europe/Kiev:
+ *   Летнее время действует с последнего воскресенья марта 03:00 до последнего воскресенья октября 04:00.
+ *   Зимой offset +02:00, летом +03:00.
+ */
+function lastSunday(year, monthIndex /* 0-based */) {
+  // Возвращает дату последнего воскресенья указанного месяца (UTC)
+  const d = new Date(Date.UTC(year, monthIndex + 1, 0)); // последний день месяца
+  const dow = d.getUTCDay(); // 0..6 (вс..сб)
+  const back = (dow + 7 - 0) % 7;
+  d.setUTCDate(d.getUTCDate() - back);
+  return d; // UTC дата-воскресенье
+}
+function isKievSummerTime(ymd /* 'YYYY-MM-DD' */) {
+  const [y, m, day] = ymd.split('-').map(Number);
+  const d = new Date(Date.UTC(y, m - 1, day, 12, 0, 0)); // середина дня, чтобы не попадать на край
+  const marchLastSun = lastSunday(y, 2);   // март
+  const octLastSun   = lastSunday(y, 9);   // октябрь
+
+  // Летнее время: от 03:00 последнего воскресенья марта до 04:00 последнего воскресенья октября
+  const start = new Date(Date.UTC(y, 2, marchLastSun.getUTCDate(), 0, 0, 0)); // сравниваем по дням
+  const end   = new Date(Date.UTC(y, 9, octLastSun.getUTCDate(), 0, 0, 0));
+
+  return d >= start && d < end; // в простом «по дням» сравнении достаточно
+}
+function offsetForKiev(ymd) {
+  return isKievSummerTime(ymd) ? '+03:00' : '+02:00';
+}
+function dayBoundsWithOffset(ymd, tz = TIMEZONE) {
+  // пока поддерживаем именно Europe/Kiev (или совместимые), при необходимости можно расширить
+  const off = tz === 'Europe/Kiev' ? offsetForKiev(ymd) : '+00:00';
+  return {
+    start: `${ymd}T00:00:00${off}`,
+    end:   `${ymd}T23:59:59${off}`,
+  };
+}
 
 // ------------ Telegram bot ------------
 const bot = new Telegraf(BOT_TOKEN);
 
-// простые «сессии» в памяти процесса
+// простейшая «сессия» в памяти процесса
 const sessions = new Map(); // userId -> { serviceId, dateYMD, slotId, step, name, phone }
 
 bot.start(ctx =>
@@ -148,10 +188,9 @@ bot.action(/^day:(.+):(\d{4}-\d{2}-\d{2})$/, async (ctx) => {
     const ymd = ctx.match[2];
     await ctx.answerCbQuery();
 
-    const startDate = startOfUTC(ymd).toISOString();
-    const endDate   = endOfUTC(ymd).toISOString();
+    const { start, end } = dayBoundsWithOffset(ymd, TIMEZONE);
 
-    const j = await restQueryAvailability({ serviceId, startDate, endDate });
+    const j = await restQueryAvailability({ serviceId, startDate: start, endDate: end });
     const slots = j?.slots || j?.availability?.slots || [];
 
     if (!slots.length) {
@@ -161,10 +200,10 @@ bot.action(/^day:(.+):(\d{4}-\d{2}-\d{2})$/, async (ctx) => {
     }
 
     const btns = slots.slice(0, 12).map(s => {
-      const start  = (s.startTime || s.slot?.startTime || '').slice(11, 16);
-      const end    = (s.endTime   || s.slot?.endTime   || '').slice(11, 16);
+      const startT = (s.startTime || s.slot?.startTime || '').slice(11, 16);
+      const endT   = (s.endTime   || s.slot?.endTime   || '').slice(11, 16);
       const slotId = s.slot?.id || s.id || s.slotId;
-      return [Markup.button.callback(`${start} → ${end}`, `pick:${serviceId}:${ymd}:${slotId}`)];
+      return [Markup.button.callback(`${startT} → ${endT}`, `pick:${serviceId}:${ymd}:${slotId}`)];
     });
 
     btns.push([Markup.button.callback('⬅️ До календаря', `svc:${serviceId}`)]);
@@ -175,7 +214,7 @@ bot.action(/^day:(.+):(\d{4}-\d{2}-\d{2})$/, async (ctx) => {
   }
 });
 
-// выбор слота -> сбор имени/телефона -> createBooking
+// выбор слота -> имя/телефон -> createBooking
 bot.action(/^pick:(.+):(\d{4}-\d{2}-\d{2}):(.+)$/, async (ctx) => {
   try {
     const [_, serviceId, ymd, slotId] = ctx.match;
@@ -203,7 +242,7 @@ bot.on('text', async (ctx) => {
       const phone = ctx.message.text.trim();
       if (!/^\+?\d{10,15}$/.test(phone)) {
         return ctx.reply('Телефон має бути у форматі +380XXXXXXXXX (10–15 цифр).');
-        }
+      }
       s.phone = phone;
 
       const r = await wix.bookings.createBooking({
@@ -226,12 +265,26 @@ bot.on('text', async (ctx) => {
 });
 
 // ------------ HTTP (health/debug) ------------
-app.get('/',        (_, res) => res.send('ok — /health, /debug/services'));
+app.get('/',        (_, res) => res.send('ok — /health, /debug/services, /debug/availability'));
 app.get('/health',  (_, res) => res.send('ok'));
 app.get('/debug/services', async (_, res) => {
   try {
     const items = await getServices();
     res.json({ ok: true, count: items.length, items });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e?.response?.data || e?.message || e });
+  }
+});
+
+// /debug/availability?serviceId=<ID>&ymd=YYYY-MM-DD[&tz=Europe/Kiev]
+app.get('/debug/availability', async (req, res) => {
+  try {
+    const { serviceId, ymd, tz } = req.query;
+    if (!serviceId || !ymd) return res.status(400).json({ ok: false, error: 'serviceId and ymd are required' });
+    const tzz = typeof tz === 'string' ? tz : TIMEZONE;
+    const { start, end } = dayBoundsWithOffset(String(ymd), tzz);
+    const j = await restQueryAvailability({ serviceId: String(serviceId), startDate: start, endDate: end });
+    res.json({ ok: true, timezone: tzz, start, end, raw: j });
   } catch (e) {
     res.status(500).json({ ok: false, error: e?.response?.data || e?.message || e });
   }
@@ -249,5 +302,5 @@ app.listen(PORT, async () => {
   } catch (e) {
     console.error('Webhook set error:', e?.response?.data || e);
   }
-  console.log('Server listening on', PORT);
+  console.log('Server listening on', PORT, 'TIMEZONE =', TIMEZONE);
 });
