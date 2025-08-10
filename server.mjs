@@ -10,11 +10,11 @@ import { services as servicesApi, bookings as bookingsApi } from '@wix/bookings'
 const REQ_ENV = ['BOT_TOKEN', 'ADMIN_API_KEY', 'SITE_ID', 'PUBLIC_URL'];
 REQ_ENV.forEach(k => { if (!process.env[k]) console.error(`ENV ${k} is missing`); });
 
-const BOT_TOKEN   = process.env.BOT_TOKEN;
-const ADMIN_API_KEY = process.env.ADMIN_API_KEY;
-const SITE_ID     = process.env.SITE_ID;
-const PUBLIC_URL  = process.env.PUBLIC_URL;
-const TIMEZONE    = process.env.TIMEZONE || 'Europe/Kyiv';
+const BOT_TOKEN    = process.env.BOT_TOKEN;
+const ADMIN_API_KEY= process.env.ADMIN_API_KEY;
+const SITE_ID      = process.env.SITE_ID;
+const PUBLIC_URL   = process.env.PUBLIC_URL;
+const TIMEZONE     = process.env.TIMEZONE || 'Europe/Kyiv';
 
 const app = express();
 app.use(express.json());
@@ -43,17 +43,19 @@ async function restQueryServices() {
   return r.json(); // { services: [...] }
 }
 
-// !!! FIX: filter всередині query
-async function restQueryAvailability({ serviceId, from, to }) {
+// !!! FIXED: startDate/endDate у filter
+async function restQueryAvailability({ serviceId, startDate, endDate }) {
   const r = await fetch('https://www.wixapis.com/bookings/v1/availability/query', {
     method: 'POST',
     headers: baseHeaders,
     body: JSON.stringify({
       query: {
-        filter: { serviceId },
-        from,
-        to,
-        timeZone: TIMEZONE, // не обовʼязково, але корисно
+        filter: {
+          serviceId,
+          startDate,
+          endDate,
+          timeZone: TIMEZONE, // деякі інсталяції очікують у filter
+        },
       },
     }),
   });
@@ -89,7 +91,7 @@ function endOfUTC(ymd)   { return new Date(`${ymd}T23:59:59.999Z`); }
 // ================== Telegram bot ==================
 const bot = new Telegraf(BOT_TOKEN);
 
-// Простенькі “сесії” в памʼяті процеса
+// Прості “сесії” в памʼяті процеса
 const sessions = new Map(); // userId => { serviceId, dateYMD, slotId, step, name, phone }
 
 bot.start((ctx) =>
@@ -114,7 +116,7 @@ bot.hears('🗂 Послуги', async (ctx) => {
   }
 });
 
-// Обрали послугу — показуємо календар на 7 днів
+// Обрали послугу — календар на 7 днів
 bot.action(/^svc:(.+)$/, async (ctx) => {
   try {
     const serviceId = ctx.match[1];
@@ -143,7 +145,7 @@ bot.action(/^svc:(.+)$/, async (ctx) => {
 });
 
 bot.action('back:services', async (ctx) => {
-  // повертаємося до списку послуг
+  // повернення до списку послуг
   return bot.hears.handlers.get('🗂 Послуги')[0](ctx);
 });
 
@@ -154,10 +156,10 @@ bot.action(/^day:(.+):(\d{4}-\d{2}-\d{2})$/, async (ctx) => {
     const ymd = ctx.match[2];
     await ctx.answerCbQuery();
 
-    const from = startOfUTC(ymd).toISOString();
-    const to   = endOfUTC(ymd).toISOString();
+    const startDate = startOfUTC(ymd).toISOString();
+    const endDate   = endOfUTC(ymd).toISOString();
 
-    const j = await restQueryAvailability({ serviceId, from, to });
+    const j = await restQueryAvailability({ serviceId, startDate, endDate });
     const slots = j?.slots || j?.availability?.slots || [];
 
     if (!slots.length) {
@@ -181,7 +183,7 @@ bot.action(/^day:(.+):(\d{4}-\d{2}-\d{2})$/, async (ctx) => {
   }
 });
 
-// Обрали слот — просимо імʼя та телефон, потім бронюємо
+// Обрали слот — імʼя -> телефон -> бронь
 bot.action(/^pick:(.+):(\d{4}-\d{2}-\d{2}):(.+)$/, async (ctx) => {
   try {
     const [_, serviceId, ymd, slotId] = ctx.match;
@@ -212,7 +214,6 @@ bot.on('text', async (ctx) => {
       }
       s.phone = phone;
 
-      // створюємо бронь (SDK)
       const r = await wix.bookings.createBooking({
         booking: {
           slot: { slotId: s.slotId, serviceId: s.serviceId },
