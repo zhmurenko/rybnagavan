@@ -8,12 +8,13 @@ dotenv.config();
 const app = express();
 app.use(express.json());
 
-const TOKEN        = process.env.BOT_TOKEN;
-const CHAT_ID      = process.env.CHAT_ID;
-const WIX_API_KEY  = process.env.WIX_API_KEY;   // без "Bearer"
-const WIX_SITE_ID  = process.env.WIX_SITE_ID;   // metasiteId из вебхука
-const SECRET_TOKEN = process.env.SECRET_TOKEN;
+const TOKEN        = process.env.BOT_TOKEN;      // токен Telegram-бота
+const CHAT_ID      = process.env.CHAT_ID;        // чат/канал ID
+const WIX_API_KEY  = process.env.WIX_API_KEY;    // API Key Wix (БЕЗ "Bearer")
+const WIX_SITE_ID  = process.env.WIX_SITE_ID;    // metasiteId (из вебхука Wix)
+const SECRET_TOKEN = process.env.SECRET_TOKEN;   // секрет для ссылок в кнопках
 
+// ---- helpers ----
 async function sendToTelegram(text, buttons = null) {
   const body = { chat_id: CHAT_ID, text, parse_mode: 'Markdown' };
   if (buttons) body.reply_markup = { inline_keyboard: buttons };
@@ -43,7 +44,28 @@ function formatDate(d) {
   return new Date(d).toLocaleString('uk-UA', { timeZone: 'Europe/Kiev' });
 }
 
-/* ------------------------ ВЕБХУК ОТ WIX ------------------------ */
+function renderErrorCard(text) {
+  const safe = (text || '').replaceAll('<','&lt;');
+  return `
+  <div style="font-family:sans-serif;padding:24px;background:#fff;border-radius:12px;max-width:780px;margin:40px auto;box-shadow:0 2px 8px rgba(0,0,0,.1)">
+    <h2 style="color:#c00;margin:0 0 12px">❌ Ошибка при обновлении статуса в Wix</h2>
+    <div style="white-space:pre-wrap;font-family:ui-monospace,Consolas,monospace;background:#f7f7f8;border:1px solid #eee;border-radius:8px;padding:12px;max-height:360px;overflow:auto">${safe}</div>
+    <p style="color:#666">Проверь: <b>WIX_API_KEY</b> (Bookings.ReadWrite), <b>WIX_SITE_ID</b>, корректность <b>bookingId</b> и URL.</p>
+  </div>`;
+}
+
+function renderOkCard(message, isPaid) {
+  return `
+  <html><head><meta charset="utf-8"><title>Статус обновлён</title>
+  <style>
+    body{font-family:Arial,sans-serif;text-align:center;background:#f4f4f4;padding-top:50px}
+    .card{display:inline-block;padding:20px 40px;background:#fff;border-radius:12px;box-shadow:0 2px 8px rgba(0,0,0,.1)}
+    h1{color:${isPaid ? 'green' : 'red'}}
+  </style></head>
+  <body><div class="card"><h1>${message}</h1><p>Можно закрыть эту страницу.</p></div></body></html>`;
+}
+
+// ---- ВЕБХУК ОТ WIX: отправляем уведомление в Telegram ----
 app.post('/booking', async (req, res) => {
   try {
     const data = req.body?.data;
@@ -72,16 +94,16 @@ app.post('/booking', async (req, res) => {
 📞 Телефон: [${phone}](tel:${phone})
     `.trim();
 
-    // отправляем сообщение с временными ссылками (переобновим msg_id)
+    // сначала отправляем с временным msg_id
     const sent = await sendToTelegram(msg, [[
-      { text: '✅ Оплачено',           url: `https://rybnagavan.onrender.com/change-status/${bookingId}?token=${SECRET_TOKEN}&msg_id=TEMP&status=PAID` },
-      { text: '❌ Клиент не приехал',  url: `https://rybnagavan.onrender.com/change-status/${bookingId}?token=${SECRET_TOKEN}&msg_id=TEMP&status=CANCELLED` }
+      { text: '✅ Оплачено',          url: `https://rybnagavan.onrender.com/change-status/${bookingId}?token=${SECRET_TOKEN}&msg_id=TEMP&status=PAID` },
+      { text: '❌ Клиент не приехал', url: `https://rybnagavan.onrender.com/change-status/${bookingId}?token=${SECRET_TOKEN}&msg_id=TEMP&status=CANCELLED` }
     ]]);
 
-    // обновляем ссылки c реальным message_id
+    // затем обновляем кнопки, подставляя реальный message_id
     await editTelegramMessageMarkup(sent.result.message_id, [[
-      { text: '✅ Оплачено',           url: `https://rybnagavan.onrender.com/change-status/${bookingId}?token=${SECRET_TOKEN}&msg_id=${sent.result.message_id}&status=PAID` },
-      { text: '❌ Клиент не приехал',  url: `https://rybnagavan.onrender.com/change-status/${bookingId}?token=${SECRET_TOKEN}&msg_id=${sent.result.message_id}&status=CANCELLED` }
+      { text: '✅ Оплачено',          url: `https://rybnagavan.onrender.com/change-status/${bookingId}?token=${SECRET_TOKEN}&msg_id=${sent.result.message_id}&status=PAID` },
+      { text: '❌ Клиент не приехал', url: `https://rybnagavan.onrender.com/change-status/${bookingId}?token=${SECRET_TOKEN}&msg_id=${sent.result.message_id}&status=CANCELLED` }
     ]]);
 
     res.json({ ok: true });
@@ -91,7 +113,7 @@ app.post('/booking', async (req, res) => {
   }
 });
 
-/* ------------------ СМЕНА СТАТУСА (КНОПКИ) ------------------ */
+// ---- КНОПКИ: оплачено / не приехал ----
 app.get('/change-status/:bookingId', async (req, res) => {
   try {
     const { bookingId } = req.params;
@@ -107,81 +129,42 @@ app.get('/change-status/:bookingId', async (req, res) => {
       'wix-site-id' : WIX_SITE_ID
     };
 
-    let successText = '';
     if (status === 'PAID') {
-      // 1) подтверждаем бронь
-      const r1 = await fetch(`https://www.wixapis.com/bookings/v2/confirmation/${bookingId}:confirmOrDecline`, {
+      // бронь у тебя уже CONFIRMED → сразу отмечаем оплату
+      const r = await fetch(`https://www.wixapis.com/bookings/v2/bookings/${bookingId}:markAsPaid`, {
         method: 'POST',
-        headers: wixHeaders,
-        body: JSON.stringify({ action: 'CONFIRM' })
-      });
-      if (!r1.ok) {
-        const t = await r1.text();
-        return res.status(502).send(renderErrorCard(t));
-      }
-
-      // 2) отмечаем как оплачено
-      const r2 = await fetch(`https://www.wixapis.com/bookings/v2/bookings/${bookingId}:markAsPaid`, {
-        method: 'POST',
-        headers: wixHeaders,
-        body: JSON.stringify({}) // тело не обязательно
-      });
-      if (!r2.ok) {
-        const t = await r2.text();
-        return res.status(502).send(renderErrorCard(t));
-      }
-
-      successText = '💰 Оплата успешно подтверждена';
-    } else if (status === 'CANCELLED') {
-      // отмена брони
-      const r = await fetch(`https://www.wixapis.com/bookings/v2/bookings/${bookingId}:cancel`, {
-        method: 'POST',
-        headers: wixHeaders,
-        body: JSON.stringify({}) // можно пусто
+        headers: wixHeaders
       });
       if (!r.ok) {
         const t = await r.text();
         return res.status(502).send(renderErrorCard(t));
       }
-      successText = '🚫 Бронь отменена (клиент не приехал)';
-    } else {
-      return res.status(400).send('<h2 style="color:red; font-family:sans-serif;">❌ Неизвестный статус</h2>');
+
+      await editTelegramMessageMarkup(msg_id, [[{ text: '✅ Оплачено' }]]);
+      return res.send(renderOkCard('💰 Оплата успешно подтверждена', true));
     }
 
-    // Обновляем кнопки в исходном сообщении — оставляем только выбранный статус
-    const newButtons = status === 'PAID'
-      ? [[{ text: '✅ Оплачено' }]]
-      : [[{ text: '❌ Не состоялась' }]];
-    await editTelegramMessageMarkup(msg_id, newButtons);
+    if (status === 'CANCELLED')) {
+      const r = await fetch(`https://www.wixapis.com/bookings/v2/bookings/${bookingId}:cancel`, {
+        method: 'POST',
+        headers: wixHeaders,
+        body: JSON.stringify({ cancellationReason: 'NO_SHOW' })
+      });
+      if (!r.ok) {
+        const t = await r.text();
+        return res.status(502).send(renderErrorCard(t));
+      }
 
-    // Красивый HTML ответ
-    res.send(renderOkCard(successText, status === 'PAID'));
+      await editTelegramMessageMarkup(msg_id, [[{ text: '❌ Не состоялась' }]]);
+      return res.send(renderOkCard('🚫 Бронь отменена (клиент не приехал)', false));
+    }
+
+    return res.status(400).send('<h2 style="color:red; font-family:sans-serif;">❌ Неизвестный статус</h2>');
   } catch (e) {
     console.error('Ошибка /change-status:', e);
     res.status(500).send('<h2 style="color:red; font-family:sans-serif;">❌ Ошибка сервера</h2>');
   }
 });
-
-function renderErrorCard(text) {
-  const safe = (text || '').replaceAll('<','&lt;');
-  return `
-  <div style="font-family:sans-serif;padding:24px;background:#fff;border-radius:12px;max-width:780px;margin:40px auto;box-shadow:0 2px 8px rgba(0,0,0,.1)">
-    <h2 style="color:#c00;margin:0 0 12px">❌ Ошибка при обновлении статуса в Wix</h2>
-    <div style="white-space:pre-wrap;font-family:ui-monospace,Consolas,monospace;background:#f7f7f8;border:1px solid #eee;border-radius:8px;padding:12px;max-height:360px;overflow:auto">${safe}</div>
-    <p style="color:#666">Проверь: <b>WIX_API_KEY</b> (Bookings.ReadWrite), <b>WIX_SITE_ID</b>, корректность <b>bookingId</b> и URL.</p>
-  </div>`;
-}
-
-function renderOkCard(message, isPaid) {
-  return `
-  <html><head><meta charset="utf-8"><title>Статус обновлён</title>
-  <style>
-    body{font-family:Arial,sans-serif;text-align:center;background:#f4f4f4;padding-top:50px}
-    .card{display:inline-block;padding:20px 40px;background:#fff;border-radius:12px;box-shadow:0 2px 8px rgba(0,0,0,.1)}
-    h1{color:${isPaid ? 'green' : 'red'}}
-  </style></head>
-  <body><div class="card"><h1>${message}</h1><p>Можно закрыть эту страницу.</p></div></body></html>`;
-}
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
