@@ -7,23 +7,21 @@ import { bookings } from '@wix/bookings';
 const app = express();
 app.use(express.json());
 
-// ---- валидация переменных окружения (чтобы сразу видно было в логах) ----
-['BOT_TOKEN', 'CLIENT_ID', 'CLIENT_SECRET', 'PUBLIC_URL'].forEach((k) => {
-  if (!process.env[k]) {
-    console.error(`ENV ${k} is missing`);
-  }
+// проверим env — чтобы в логах сразу было понятно
+['BOT_TOKEN', 'CLIENT_ID', 'CLIENT_SECRET', 'PUBLIC_URL'].forEach(k => {
+  if (!process.env[k]) console.error(`ENV ${k} is missing`);
 });
 
-// ---- Wix SDK (OAuth: client_credentials) ----
+// Wix SDK (OAuth client_credentials)
 const wix = createClient({
   modules: { bookings },
   auth: OAuthStrategy({
     clientId: process.env.CLIENT_ID,
-    clientSecret: process.env.CLIENT_SECRET,
+    clientSecret: process.env.CLIENT_SECRET
   }),
 });
 
-// ВАЖНО: задать сайт, чтобы Bookings знал, куда лезть
+// важно: задать сайт, чтобы Bookings понимал контекст
 if (process.env.SITE_ID) {
   try {
     wix.setSite({ siteId: process.env.SITE_ID });
@@ -35,21 +33,18 @@ if (process.env.SITE_ID) {
   console.warn('ENV SITE_ID is missing — services/availability may fail');
 }
 
-// ---- Telegram Bot ----
+// Telegram Bot
 const bot = new Telegraf(process.env.BOT_TOKEN);
 
-// /start
 bot.start((ctx) =>
-  ctx.reply(
-    'Привіт! Оберіть дію:',
-    Markup.keyboard([['🗂 Послуги', '🗓 Забронювати']]).resize()
-  )
+  ctx.reply('Привіт! Оберіть дію:', Markup.keyboard([['🗂 Послуги', '🗓 Забронювати']]).resize())
 );
 
-// список послуг
+// Список послуг
 bot.hears('🗂 Послуги', async (ctx) => {
   try {
-    const resp = await wix.bookings.services.queryServices().find();
+    // ВАЖНО: используем корневой метод модуля
+    const resp = await wix.bookings.queryServices().find();
     const items = resp?.items || [];
     if (!items.length) return ctx.reply('Послуг поки немає.');
     const rows = items.map(s => `• ${s.info?.name} — ${s._id}`).join('\n');
@@ -60,7 +55,7 @@ bot.hears('🗂 Послуги', async (ctx) => {
   }
 });
 
-// слоты на сегодня: /slots <SERVICE_ID>
+// Слоти на сьогодні: /slots <SERVICE_ID>
 bot.command('slots', async (ctx) => {
   try {
     const [, serviceId] = ctx.message.text.split(' ').map(s => s.trim());
@@ -69,7 +64,8 @@ bot.command('slots', async (ctx) => {
     const from = new Date();
     const to = new Date(Date.now() + 24 * 60 * 60 * 1000);
 
-    const resp = await wix.bookings.availability.queryAvailability({
+    // тоже корневой метод модуля
+    const resp = await wix.bookings.queryAvailability({
       query: { serviceId, from: from.toISOString(), to: to.toISOString() }
     });
 
@@ -87,7 +83,7 @@ bot.command('slots', async (ctx) => {
   }
 });
 
-// примитивные сессии в памяти процесса
+// простая «сессия» в памяти процесса
 const sessions = new Map();
 
 bot.action(/pick:(.+):(.+)/, async (ctx) => {
@@ -99,13 +95,14 @@ bot.action(/pick:(.+):(.+)/, async (ctx) => {
 
 bot.on('text', async (ctx) => {
   const s = sessions.get(ctx.from.id);
-  if (!s?.slotId) return; // ждём телефон? если нет — выходим
+  if (!s?.slotId) return;
 
   const phone = ctx.message.text.trim();
   if (!/^\+?\d{10,15}$/.test(phone)) return ctx.reply('Схоже, це не номер. Надішли номер у форматі +380...');
 
   try {
-    const r = await wix.bookings.bookings.createBooking({
+    // и тут — корневой метод createBooking
+    const r = await wix.bookings.createBooking({
       booking: {
         slot: { slotId: s.slotId, serviceId: s.serviceId },
         contactDetails: { fullName: ctx.from.first_name || 'Guest', phone },
@@ -121,12 +118,12 @@ bot.on('text', async (ctx) => {
   }
 });
 
-// --- HTTP роуты ---
+// HTTP роуты
 app.get('/', (_, res) => res.send('ok — bot webhook is /tg/<BOT_TOKEN>, health is /health'));
 app.get('/health', (_, res) => res.send('ok'));
 app.use(bot.webhookCallback(`/tg/${process.env.BOT_TOKEN}`));
 
-// --- запуск и установка вебхука ---
+// запуск и вебхук
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
   try {
