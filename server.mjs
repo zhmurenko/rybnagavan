@@ -1,109 +1,121 @@
 // server.mjs
-// Node >=18 (на Render fetch глобальный). Модульный режим (type: module).
+// ===================== Rybna Gavan bot + Wix OAuth =====================
+// Вимагає змінні оточення:
+// BOT_TOKEN, CLIENT_ID, CLIENT_SECRET, PUBLIC_URL, WIX_REFRESH_TOKEN (після інсталяції)
+// Не забудь у Wix Headless клієнті додати Redirect URI:  https://<твій_домен>.onrender.com/oauth/callback
 
 import express from 'express';
-import bodyParser from 'body-parser';
+import fetch from 'node-fetch';
 import { Telegraf, Markup } from 'telegraf';
 
-// =========================
-// ENV
-// =========================
 const {
+  BOT_TOKEN,
+  CLIENT_ID,
+  CLIENT_SECRET,
+  PUBLIC_URL,
+  WIX_REFRESH_TOKEN,
   PORT = 3000,
-  PUBLIC_URL = 'https://rybnagavan.onrender.com',
   TIMEZONE = 'Europe/Kiev',
-  BOT_TOKEN,                // Telegram
-  CLIENT_ID,                // Wix OAuth client id
-  CLIENT_SECRET,            // Wix OAuth client secret
-  WIX_REFRESH_TOKEN         // Wix Refresh token (после OAuth обмена)
 } = process.env;
 
-if (!PUBLIC_URL) console.warn('WARN: PUBLIC_URL is not set');
-if (!TIMEZONE) console.warn('WARN: TIMEZONE is not set, default Europe/Kiev');
+// -------------------------- helpers --------------------------
 
-// =========================
-// App
-// =========================
-const app = express();
-app.use(bodyParser.json());
+/** Лог короткими тегами */
+const log = (...args) => console.log('[srv]', ...args);
 
-// =========================
-// Telegram bot (минималка)
-// =========================
-let bot;
-if (BOT_TOKEN) {
-  bot = new Telegraf(BOT_TOKEN);
-
-  bot.start((ctx) =>
-    ctx.reply(
-      'Привіт! Я тут. Основне — OAuth з Wix. Команди:\n' +
-      '/services — показати послуги (через Wix API)\n' +
-      '/authlink — посилання для авторизації Wix (OAuth)'
-    )
-  );
-
-  bot.command('authlink', (ctx) => {
-    const url = buildWixInstallLink();
-    ctx.reply(
-      'Відкрий посилання для авторизації у Wix (OAuth):\n' + url,
-      { disable_web_page_preview: true }
-    );
-  });
-
-  bot.command('services', async (ctx) => {
-    try {
-      const list = await wixListServices();
-      if (!list.length) return ctx.reply('Послуги не знайдені.');
-      const lines = list.map(s => `• ${s.name} — ${s._id}`).join('\n');
-      ctx.reply('Доступні послуги:\n' + lines);
-    } catch (e) {
-      console.error('services error:', e);
-      ctx.reply('Не вдалось отримати послуги.');
-    }
-  });
-
-  // Вебхук
-  app.use(await bot.createWebhook({ domain: PUBLIC_URL }));
-} else {
-  console.warn('BOT_TOKEN не задан — Telegram бот відключений.');
-}
-
-// =========================
-// Wix OAuth helpers
-// =========================
-
-// 1) Ссылка для установки / авторизации приложения (headless)
-function buildWixInstallLink() {
-  const params = new URLSearchParams({
-    client_id: CLIENT_ID ?? '',
-    redirect_uri: `${PUBLIC_URL}/oauth/callback`,
-    // Вкажи тільки потрібні скоупи. Для бронювання зазвичай потрібні:
-    // offline_access + читання/керування бронями/послугами.
-    scope: [
-      'offline_access',
-      'bookings.read',
-      'bookings.manage'
-    ].join(' '),
-    state: 'rybnagavan'
-  });
-  return `https://www.wix.com/installer/install?${params.toString()}`;
-}
-
-// 2) Обмен кода на refresh_token (коллбек)
-app.get('/oauth/callback', async (req, res) => {
-  const { code, state, error, error_description } = req.query;
-  if (error) {
-    return res
-      .status(400)
-      .send(`OAuth error: ${error} - ${error_description || ''}`);
+/** Обмін refresh_token -> access_token (короткоживучий) */
+async function getAccessToken() {
+  if (!CLIENT_ID || !CLIENT_SECRET || !WIX_REFRESH_TOKEN) {
+    throw new Error('Missing CLIENT_ID / CLIENT_SECRET / WIX_REFRESH_TOKEN');
   }
-  if (!code) return res.status(400).send('Missing authorization code');
 
+  const resp = await fetch('https://www.wix.com/oauth/access', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      grant_type: 'refresh_token',
+      client_id: CLIENT_ID,
+      client_secret: CLIENT_SECRET,
+      refresh_token: WIX_REFRESH_TOKEN,
+    }),
+  });
+
+  const data = await resp.json();
+  if (!resp.ok) {
+    throw new Error(`refresh_token exchange failed: ${JSON.stringify(data)}`);
+  }
+  return data.access_token;
+}
+
+/** REST: отримати список послуг Bookings */
+async function fetchServices() {
+  const access = await getAccessToken();
+
+  const resp = await fetch('https://www.wixapis.com/bookings/v1/services/query', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${access}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ query: {} }),
+  });
+
+  const data = await resp.json();
+  if (!resp.ok) {
+    throw new Error(`services query failed: ${JSON.stringify(data)}`);
+  }
+  return data.services || data.items || [];
+}
+
+// -------------------------- express app --------------------------
+
+const app = express();
+app.use(express.json());
+
+app.get('/', (_req, res) => {
+  res.type('text').send('RybnaGavan bot is alive');
+});
+
+app.get('/ping', (_req, res) => {
+  res.json({ ok: true, ts: Date.now(), tz: TIMEZONE });
+});
+
+// ===== 1) START INSTALL =====
+app.get('/install', (req, res) => {
   try {
-    const tokenRes = await fetch('https://www.wix.com/oauth/access', {
+    if (!CLIENT_ID || !PUBLIC_URL) {
+      return res
+        .status(400)
+        .send('CLIENT_ID or PUBLIC_URL is not set in env');
+    }
+    const redirectUri = encodeURIComponent(`${PUBLIC_URL}/oauth/callback`);
+    // мінімальний скоуп; при потребі додай ще
+    const scope = encodeURIComponent('offline_access bookings.read bookings.manage');
+    const url = `https://www.wix.com/installer/install?client_id=${CLIENT_ID}&redirect_uri=${redirectUri}&scope=${scope}&state=rybnagavan`;
+
+    res.redirect(url);
+  } catch (e) {
+    log('install redirect error:', e);
+    res.status(500).send('Install redirect error');
+  }
+});
+
+// ===== 2) OAUTH CALLBACK =====
+app.get('/oauth/callback', async (req, res) => {
+  try {
+    const { code, error, error_description } = req.query;
+
+    if (error) {
+      return res.status(400).send(`OAuth error: ${error} - ${error_description || ''}`);
+    }
+    if (!code) {
+      return res.status(400).send('Missing "code"');
+    }
+
+    const tokenResp = await fetch('https://www.wix.com/oauth/access', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
         grant_type: 'authorization_code',
         client_id: CLIENT_ID,
         client_secret: CLIENT_SECRET,
@@ -112,186 +124,111 @@ app.get('/oauth/callback', async (req, res) => {
       }),
     });
 
-    const data = await tokenRes.json();
-    console.log('OAuth exchange result:', data);
-
-    if (!tokenRes.ok) {
+    const data = await tokenResp.json();
+    if (!tokenResp.ok) {
+      log('Token exchange failed:', data);
       return res
         .status(500)
-        .send(`OAuth exchange failed: ${tokenRes.status} ${JSON.stringify(data)}`);
+        .send(`Token exchange failed: <pre>${JSON.stringify(data, null, 2)}</pre>`);
     }
 
-    // Показываем токены пользователю прямо в браузере (скопируй WIX_REFRESH_TOKEN)
-    res
-      .status(200)
-      .send(
-        `<pre>OK
-access_token: ${data.access_token || '(получается, но истечет быстро)'}
-refresh_token: ${data.refresh_token || '(не пришел)'}
-expires_in: ${data.expires_in || ''}
-scope: ${data.scope || ''}
+    const { refresh_token, access_token, expires_in } = data;
+    log('== TOKENS RECEIVED == expires_in:', expires_in);
 
-/**
- * СКОПІЮЙ "refresh_token" і встав у Render як:
- * WIX_REFRESH_TOKEN=...
- * Потім Redeploy.
- */
-</pre>`
-      );
-  } catch (err) {
-    console.error('OAuth callback error:', err);
-    res.status(500).send('Error during token exchange');
+    // На Render не можемо оновити env з коду, тож просто показуємо користувачу:
+    res.set('Content-Type', 'text/html; charset=utf-8');
+    res.send(`
+      <h2>✅ Установка успішна</h2>
+      <p>Скопіюй цей <b>WIX_REFRESH_TOKEN</b> у змінні оточення Render і натисни <i>Save, rebuild, and deploy</i>:</p>
+      <pre style="padding:12px;border:1px solid #ccc;white-space:pre-wrap">${refresh_token}</pre>
+      <hr/>
+      <p><small>Короткоживучий access_token (для дебагу):</small></p>
+      <pre style="padding:12px;border:1px solid #ccc;white-space:pre-wrap">${access_token}</pre>
+    `);
+  } catch (e) {
+    log('OAuth callback error:', e);
+    res.status(500).send('OAuth callback error');
   }
 });
 
-// 3) Функция обмена refresh_token -> access_token
-async function getAccessTokenFromRefresh() {
-  if (!WIX_REFRESH_TOKEN) {
-    throw new Error('WIX_REFRESH_TOKEN is not set. Спочатку пройди OAuth.');
-  }
-  const r = await fetch('https://www.wix.com/oauth/access', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      grant_type: 'refresh_token',
-      client_id: CLIENT_ID,
-      client_secret: CLIENT_SECRET,
-      refresh_token: WIX_REFRESH_TOKEN,
-    }),
-  });
-  const j = await r.json();
-  if (!r.ok) {
-    throw new Error(`Refresh exchange failed: ${r.status} ${JSON.stringify(j)}`);
-  }
-  return j.access_token;
-}
-
-// Общий помощник для Wix API
-async function wixFetch(path, body = {}) {
-  const access = await getAccessTokenFromRefresh();
-  const r = await fetch(`https://www.wixapis.com${path}`, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${access}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify(body),
-  });
-  const j = await r.json();
-  if (!r.ok) {
-    throw new Error(`${path} ${r.status} ${JSON.stringify(j)}`);
-  }
-  return j;
-}
-
-// =========================
-// Wix: Services & Availability (debug endpoints)
-// =========================
-
-// Получить список услуг
-async function wixListServices() {
-  // Минимальный валидный фильтр (пустой не допускается в некоторых аккаунтах)
-  const body = {
-    query: {
-      filter: { hidden: false }, // подстраховка, чтобы не был пуст
-      sort: [{ fieldName: 'name', order: 'ASC' }],
-      paging: { limit: 50 },
-    },
-  };
-  const data = await wixFetch('/bookings/v1/services/query', body);
-  return (data.services || []).map((s) => ({
-    _id: s._id || s.id || s.appId || s.appid || 'unknown',
-    name: s.name?.['ru'] || s.name?.['uk'] || s.name?.['en'] || s.name || 'Без назви',
-  }));
-}
-
-// DEBUG: список услуг (в браузер)
+// ===== 3) DEBUG: перевірка сервісів (ручна) =====
 app.get('/debug/services', async (_req, res) => {
   try {
-    const list = await wixListServices();
-    res.json({ ok: true, services: list });
+    const items = await fetchServices();
+    res.json({ ok: true, count: items.length, items });
   } catch (e) {
-    console.error('debug/services error:', e);
-    res.status(500).json({ ok: false, error: String(e.message || e) });
+    res.status(500).json({ ok: false, error: String(e) });
   }
 });
 
-// DEBUG: доступность за день
-// GET /debug/availability?serviceId=<UUID>&ymd=2025-08-15
-app.get('/debug/availability', async (req, res) => {
-  const serviceId = req.query.serviceId;
-  const ymd = req.query.ymd; // YYYY-MM-DD
-  if (!serviceId || !ymd) {
-    return res.status(400).json({ ok: false, error: 'need serviceId and ymd=YYYY-MM-DD' });
-  }
+// -------------------------- telegram bot --------------------------
 
-  // Вспомогательные ISO границы дня в TZ
-  const dayStart = `${ymd}T00:00:00${tzOffset(TIMEZONE)}`;
-  const dayEnd = `${ymd}T23:59:59${tzOffset(TIMEZONE)}`;
+let bot;
+if (BOT_TOKEN) {
+  bot = new Telegraf(BOT_TOKEN);
 
-  try {
-    // Этот эндпоинт стабильно возвращает availabilityEntries (как у тебя на скрине)
-    const body = {
-      filter: {
-        serviceId,
-      },
-      start: dayStart,
-      end: dayEnd,
-      timezone: TIMEZONE,
-    };
-    const data = await wixFetch('/bookings/v2/availability/calendar', body);
-    res.json({
-      ok: true,
-      timezone: TIMEZONE,
-      start: dayStart,
-      end: dayEnd,
-      raw: data,
-    });
-  } catch (e) {
-    console.error('debug/availability error:', e);
-    res.status(500).json({ ok: false, error: String(e.message || e) });
-  }
-});
+  bot.start(async (ctx) => {
+    const kb = Markup.keyboard([['📦 Послуги']]).resize();
+    await ctx.reply('Привіт! Оберіть дію:', kb);
+  });
 
-// Простой корень (проверка живости)
-app.get('/', (_req, res) => {
-  res.type('text').send('OK rybnagavan bot server');
-});
-
-// =========================
-// Utils
-// =========================
-
-// Простейший офсет (+03:00) для указанной TZ.
-// Для Production лучше использовать библиотеку (luxon/dayjs/tz).
-function tzOffset(tz) {
-  try {
-    const now = new Date();
-    // Получим смещение как форматированный DST-учитывающий offest:
-    const fmt = new Intl.DateTimeFormat('en-US', {
-      timeZone: tz,
-      timeZoneName: 'shortOffset'
-    }).formatToParts(now);
-    const off = fmt.find(p => p.type === 'timeZoneName')?.value || 'GMT+0';
-    // off формата GMT+3 — приведём к +03:00
-    const m = off.match(/GMT([+\-]\d+)(?::(\d{2}))?/i);
-    if (m) {
-      const h = String(Math.abs(parseInt(m[1], 10))).padStart(2, '0');
-      const sign = m[1].startsWith('-') ? '-' : '+';
-      const mm = m[2] ?? '00';
-      return `${sign}${h}:${mm}`;
+  bot.hears('📦 Послуги', async (ctx) => {
+    try {
+      const services = await fetchServices();
+      if (!services.length) {
+        return ctx.reply('Не вдалося отримати список послуг.');
+      }
+      const lines = services.map((s) => {
+        const id = s._id || s.id || s.appId || '—';
+        const name = s.name?.translated?.uk || s.name?.translated?.ru || s.name?.translated?.en || s.name || 'Без назви';
+        return `• ${name} — <code>${id}</code>`;
+      });
+      await ctx.replyWithHTML(
+        `Доступні послуги:\n${lines.join('\n')}\n\nНадішли <code>/slots &lt;SERVICE_ID&gt;</code> щоб побачити вільні слоти (роут під підключення готовий, логіку можна розвинути).`
+      );
+    } catch (e) {
+      log('tg services error:', e);
+      await ctx.reply('Не вдалося отримати список послуг.');
     }
-    return '+00:00';
-  } catch {
-    return '+00:00';
+  });
+
+  // приклад технічної команди, розшириш за потреби
+  bot.command('slots', async (ctx) => {
+    const [, serviceId] = ctx.message.text.trim().split(/\s+/);
+    if (!serviceId) {
+      return ctx.reply('Вкажи ID послуги: /slots <SERVICE_ID>');
+    }
+    return ctx.reply('Слоти поки що не підключені у цьому файлі. Але OAuth вже працює ✔️');
+  });
+
+  // webhook
+  const webhookPath = `/tg/${BOT_TOKEN}`;
+  app.use(bot.webhookCallback(webhookPath));
+
+  async function setWebhook() {
+    if (!PUBLIC_URL) {
+      log('PUBLIC_URL not set, skip webhook');
+      return;
+    }
+    const url = `${PUBLIC_URL}${webhookPath}`;
+    try {
+      await bot.telegram.setWebhook(url);
+      log('Webhook set to', url);
+    } catch (e) {
+      log('setWebhook error:', e);
+    }
   }
+
+  setWebhook();
+} else {
+  log('BOT_TOKEN not set — бот відключено.');
 }
 
-// =========================
-// Start
-// =========================
+// -------------------------- start server --------------------------
+
 app.listen(PORT, () => {
-  console.log(`Server listening on ${PORT}  TIMEZONE = ${TIMEZONE}`);
-  console.log(`==> Your service is live 🎉`);
-  console.log(`==> Available at your primary URL ${PUBLIC_URL}`);
+  log(`Server listening on ${PORT} TIMEZONE = ${TIMEZONE}`);
+  if (!CLIENT_ID) log('WARN: CLIENT_ID is missing');
+  if (!CLIENT_SECRET) log('WARN: CLIENT_SECRET is missing');
+  if (!PUBLIC_URL) log('WARN: PUBLIC_URL is missing (webhook/install won’t work)');
 });
