@@ -144,7 +144,7 @@ app.get('/change-status/:bookingId', async (req, res) => {
       return res.send(renderOkCard('💰 Оплата успешно подтверждена', true));
     }
 
-    if (status === 'CANCELLED')) {
+    if (status === 'CANCELLED') {
       const r = await fetch(`https://www.wixapis.com/bookings/v2/bookings/${bookingId}:cancel`, {
         method: 'POST',
         headers: wixHeaders,
