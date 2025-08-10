@@ -12,7 +12,7 @@ const TOKEN = process.env.BOT_TOKEN;   // токен Telegram-бота
 const CHAT  = process.env.CHAT_ID;     // ID чату/каналу
 const TZ    = 'Europe/Kiev';           // часова зона для форматування дат
 
-// Екранування під MarkdownV2
+// Екранування MarkdownV2, щоб не ламались спецсимволи
 function md(text = '') {
   return String(text).replace(/[_*[\]()~`>#+\-=|{}.!]/g, '\\$&');
 }
@@ -22,53 +22,78 @@ function fmtDate(d) {
   return new Date(d).toLocaleString('uk-UA', { timeZone: TZ });
 }
 
-async function send(text) {
-  await fetch(`https://api.telegram.org/bot${TOKEN}/sendMessage`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      chat_id: CHAT,
-      text,
-      parse_mode: 'MarkdownV2',
-      disable_web_page_preview: true
-    })
-  });
+async function sendToTelegram(text) {
+  try {
+    await fetch(`https://api.telegram.org/bot${TOKEN}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: CHAT,
+        text,
+        parse_mode: 'MarkdownV2',
+        disable_web_page_preview: true
+      })
+    });
+  } catch (e) {
+    console.error('Помилка надсилання в Telegram:', e?.message || e);
+  }
 }
 
 // Проста перевірка живості
 app.get('/', (_req, res) => res.send('OK'));
 
-// Вебхук від Wix — шлемо сповіщення в Telegram
+/**
+ * Вебхук від Wix.
+ * Ігноруємо все, що не схоже на реальний payload Wix Bookings:
+ * - має бути payload.data
+ * - в data повинно бути щонайменше одне з: service_name / service_name_main_language
+ */
 app.post('/booking', async (req, res) => {
   try {
     const data = req.body?.data;
-    if (!data) {
-      await send(`⚠️ Отримано неочікувані дані:\n\`\`\`\n${md(JSON.stringify(req.body, null, 2))}\n\`\`\``);
-      return res.json({ ok: true });
+    const isWixBooking =
+      data &&
+      (data.service_name || data.service_name_main_language);
+
+    if (!isWixBooking) {
+      // Тихо ігноруємо будь-що не від Wix (щоб не засмічувати чат)
+      return res.status(200).json({ ok: true });
     }
 
-    // Поля з реального JSON від Wix
+    // --------- Поля з реального Wix payload (приклад, який ти кидав) ---------
     const service   = data.service_name_main_language || data.service_name || '';
     const sector    = data.staff_member_name || data.staff_member_name_main_language || '';
     const start     = fmtDate(data.start_date_by_business_tz || data.start_date);
     const end       = fmtDate(data.end_date);
 
-    // Сума замовлення (загальна)
-    const totalVal  = data.price?.value || data.amount_due || null;
-    const currency  = data.price?.currency || data.remaining_amount_due?.currency || data.currency || 'UAH';
-    const amountTotal = totalVal ? `${totalVal} ${currency}` : '';
+    // Загальна сума
+    // джерело №1: price.value + currency
+    // запасне: amount_due (рядок) + currency
+    let totalVal = null;
+    let currency = 'UAH';
+    if (data?.price?.value) {
+      totalVal = data.price.value;
+      currency = data.price.currency || data.currency || 'UAH';
+    } else if (data?.amount_due) {
+      totalVal = data.amount_due;
+      currency = data.currency || 'UAH';
+    }
+    const amountTotal = totalVal !== null ? `${totalVal} ${currency}` : '';
 
-    // Залишок до оплати: якщо є remaining_amount_due — використовуємо його, інакше 0
-    const remainingVal = data.remaining_amount_due?.value;
-    const remainingCur = data.remaining_amount_due?.currency || currency;
-    const amountDue = (remainingVal !== undefined && remainingVal !== null)
-      ? `${remainingVal} ${remainingCur}`
-      : `0 ${currency}`;
+    // Залишок до оплати
+    // якщо є remaining_amount_due.value — беремо його
+    // інакше вважаємо 0 того ж currency
+    let amountDue = `0 ${currency}`;
+    if (data?.remaining_amount_due?.value !== undefined && data?.remaining_amount_due?.value !== null) {
+      const remCur = data.remaining_amount_due.currency || currency;
+      amountDue = `${data.remaining_amount_due.value} ${remCur}`;
+    }
 
     const name    = `${data.contact?.name?.first || ''} ${data.contact?.name?.last || ''}`.trim();
     const phone   = data.contact?.phones?.[0]?.e164Phone || data.booking_contact_phone || '';
     const orderNo = data.order_number || '';
 
+    // --------- Повідомлення (українською) ---------
     const lines = [
       `📢 *Нове бронювання*`,
       `━━━━━━━━━━━━━━`,
@@ -84,11 +109,11 @@ app.post('/booking', async (req, res) => {
       orderNo ? `🧾 Номер замовлення: *${md(orderNo)}*` : null
     ].filter(Boolean).join('\n');
 
-    await send(lines);
+    await sendToTelegram(lines);
     res.json({ ok: true });
   } catch (e) {
-    console.error('Помилка /booking:', e);
-    res.status(500).json({ ok: false, error: e.message });
+    console.error('Помилка /booking:', e?.message || e);
+    res.status(500).json({ ok: false, error: e?.message || 'unknown' });
   }
 });
 
