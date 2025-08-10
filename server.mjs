@@ -1,306 +1,362 @@
-// server.mjs — Telegram-бот бронирования (Wix Admin API Key) с поддержкой таймзоны Europe/Kiev и DST
-
-import 'dotenv/config';
 import express from 'express';
-import { Telegraf, Markup } from 'telegraf';
-import { createClient, ApiKeyStrategy } from '@wix/sdk';
-import { services as servicesApi, bookings as bookingsApi } from '@wix/bookings';
+import fetch from 'node-fetch';
+import { Telegraf, Markup, session } from 'telegraf';
 
-// ------------ ENV ------------
-const MUST = ['BOT_TOKEN', 'ADMIN_API_KEY', 'SITE_ID', 'PUBLIC_URL'];
-MUST.forEach(k => { if (!process.env[k]) console.error(`ENV ${k} is missing`); });
+// ==== ENV ====
+const {
+  BOT_TOKEN,
+  CLIENT_ID,
+  CLIENT_SECRET,
+  WIX_REFRESH_TOKEN,
+  PUBLIC_URL,
+  PORT = 3000,
+} = process.env;
 
-const BOT_TOKEN     = process.env.BOT_TOKEN;
-const ADMIN_API_KEY = process.env.ADMIN_API_KEY;
-const SITE_ID       = process.env.SITE_ID;
-const PUBLIC_URL    = process.env.PUBLIC_URL;
-const PORT          = process.env.PORT || 3000;
+if (!BOT_TOKEN || !CLIENT_ID || !CLIENT_SECRET || !WIX_REFRESH_TOKEN || !PUBLIC_URL) {
+  console.error('Missing required env vars. Need BOT_TOKEN, CLIENT_ID, CLIENT_SECRET, WIX_REFRESH_TOKEN, PUBLIC_URL');
+  process.exit(1);
+}
 
-// Таймзона аккаунта (для человека): Europe/Kiev (Wix понимает именно Kiev)
-const TIMEZONE      = process.env.TIMEZONE || 'Europe/Kiev';
+// ==== TELEGRAM ====
+const bot = new Telegraf(BOT_TOKEN);
+bot.use(session());
 
-const app = express();
-app.use(express.json());
+// Нижние кнопки
+const mainMenu = Markup.keyboard([
+  [Markup.button.text('📦 Послуги'), Markup.button.text('🗓️ Забронювати')],
+]).resize();
 
-// ------------ Wix SDK (Admin API Key) ------------
-const wix = createClient({
-  modules: { services: servicesApi, bookings: bookingsApi },
-  auth: ApiKeyStrategy({ siteId: SITE_ID, apiKey: ADMIN_API_KEY }),
-});
+// ==== Wix Admin OAuth (client-credentials via refresh token) ====
+let _cachedAccessToken = null;
+let _tokenExp = 0;
 
-// ------------ REST helpers (services / availability) ------------
-const baseHeaders = {
-  'Content-Type': 'application/json',
-  Authorization: ADMIN_API_KEY,
-  'wix-site-id': SITE_ID,
+async function getAccessToken() {
+  const now = Date.now();
+  if (_cachedAccessToken && now < _tokenExp - 30_000) return _cachedAccessToken;
+
+  const url = 'https://www.wixapis.com/oauth/access';
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Authorization': `Basic ${Buffer.from(`${CLIENT_ID}:${CLIENT_SECRET}`).toString('base64')}` },
+    body: JSON.stringify({ grant_type: 'refresh_token', refresh_token: WIX_REFRESH_TOKEN })
+  });
+  if (!res.ok) {
+    const t = await res.text();
+    throw new Error(`OAuth ${res.status}: ${t}`);
+  }
+  const json = await res.json();
+  _cachedAccessToken = json.access_token;
+  _tokenExp = Date.now() + (json.expires_in * 1000);
+  return _cachedAccessToken;
+}
+
+async function wixFetch(path, body) {
+  const token = await getAccessToken();
+  const res = await fetch(`https://www.wixapis.com${path}`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': token,
+      'wix-site-id': '', // не обязателен для Admin API
+    },
+    body: JSON.stringify(body)
+  });
+  const text = await res.text();
+  let json;
+  try { json = JSON.parse(text); } catch { json = { raw: text }; }
+  if (!res.ok) throw new Error(`${path} ${res.status}: ${text}`);
+  return json;
+}
+
+// ==== Bookings helpers ====
+// Наши 2 услуги (название → id). Можешь поменять id на свои при желании.
+const SERVICES = [
+  { id: 'f34a76af-3072-44ca-b217-bb570e5cf297', title: 'Риболовля "Доба"' },      // Full day
+  { id: '7fab746c-0926-4157-be80-5ec252f58b11', title: 'Риболовля "Пів доби"' }, // Half day
+];
+
+// Получить доступность (availability v2) для диапазона дат, опционально по сектору
+async function queryAvailability({ serviceId, startISO, endISO, tz = 'Europe/Kiev', resourceIds = [] }) {
+  const body = {
+    query: {
+      filter: {
+        serviceId,
+        timeZone: tz,
+        startDate: startISO,
+        endDate: endISO,
+        capacity: { min: 1 }, // минимум 1 место
+      }
+    }
+  };
+  if (resourceIds.length) {
+    body.query.filter.resource = { ids: resourceIds };
+  }
+  return wixFetch('/bookings/v1/availability/query', body);
+}
+
+// Собираем список «секторов» (resourceId → name) из ближайшей доступности на 30 дней
+async function collectSectorsFromAvailability(serviceId) {
+  const start = new Date();
+  const end = new Date();
+  end.setDate(end.getDate() + 30);
+
+  const tz = 'Europe/Kiev';
+  const startISO = start.toISOString();
+  const endISO = end.toISOString();
+
+  const avail = await queryAvailability({ serviceId, startISO, endISO, tz });
+  const map = new Map();
+  const entries = avail.availabilityEntries || [];
+  for (const e of entries) {
+    const r = e.slot?.resource;
+    if (r?.id && r?.name) map.set(r.id, r.name);
+  }
+  return Array.from(map, ([id, name]) => ({ id, name })).sort((a,b) => a.name.localeCompare(b.name, 'uk'));
+}
+
+// Получить все слоты для конкретного дня и сектора
+async function daySlots({ serviceId, sectorId, dateStr, tz='Europe/Kiev' }) {
+  const day = new Date(`${dateStr}T00:00:00`);
+  const startISO = new Date(day.getTime() - day.getTimezoneOffset()*60000).toISOString(); // UTC начала дня
+  const endISO = new Date(day.getTime() + (24*60*60*1000) - day.getTimezoneOffset()*60000).toISOString();
+
+  const avail = await queryAvailability({ serviceId, startISO, endISO, tz, resourceIds: [sectorId] });
+  const entries = avail.availabilityEntries || [];
+  // Фильтруем на открытые слоты
+  const open = entries.filter(e => e.bookable && (e.openSpots ?? 0) > 0);
+  // Вернём времена старта (локальные)
+  const times = open.map(e => {
+    const startZ = e.slot?.startDate;
+    const d = startZ ? new Date(startZ) : null;
+    if (!d) return null;
+    const hh = `${d.getHours()}`.padStart(2,'0');
+    const mm = `${d.getMinutes()}`.padStart(2,'0');
+    return `${hh}:${mm}`;
+  }).filter(Boolean);
+
+  // Уникальные и отсортированные
+  return Array.from(new Set(times)).sort((a,b)=>a.localeCompare(b));
+}
+
+// ==== ТГ сценарий брони (простая FSM в session) ====
+const FLOW = {
+  IDLE: 'IDLE',
+  PICK_SERVICE: 'PICK_SERVICE',
+  PICK_SECTOR: 'PICK_SECTOR',
+  PICK_DATE: 'PICK_DATE',
+  SHOW_TIMES: 'SHOW_TIMES',
 };
 
-async function restQueryServices() {
-  const r = await fetch('https://www.wixapis.com/bookings/v1/services/query', {
-    method: 'POST',
-    headers: baseHeaders,
-    body: JSON.stringify({ query: {} }),
-  });
-  if (!r.ok) throw new Error(`services ${r.status}: ${await r.text()}`);
-  return r.json(); // { services: [...] }
-}
-
-/**
- * availability: filter.startDate/endDate — ISO с нужным смещением (+02:00 / +03:00).
- * Никакого timeZone в фильтре НЕ передаём.
- */
-async function restQueryAvailability({ serviceId, startDate, endDate }) {
-  const r = await fetch('https://www.wixapis.com/bookings/v1/availability/query', {
-    method: 'POST',
-    headers: baseHeaders,
-    body: JSON.stringify({
-      query: { filter: { serviceId, startDate, endDate } },
-    }),
-  });
-  if (!r.ok) throw new Error(`availability ${r.status}: ${await r.text()}`);
-  return r.json(); // { slots: [...] } или { availability: { slots: [...] } }
-}
-
-// Унифицированный геттер услуг
-async function getServices() {
-  try {
-    const resp = await wix.services.queryServices().find();
-    return resp?.items ?? [];
-  } catch {
-    const j = await restQueryServices();
-    return j?.services ?? j?.items ?? [];
-  }
-}
-
-// ------------ утилиты дат ------------
-const RU_DAYS = ['Нд', 'Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб'];
-const UA_MONTHS_SHORT = ['січ', 'лют', 'бер', 'квіт', 'трав', 'черв', 'лип', 'сер', 'вер', 'жовт', 'лис', 'груд'];
-const pad2 = n => String(n).padStart(2, '0');
-
-function toYMD(d) {
-  return `${d.getUTCFullYear()}-${pad2(d.getUTCMonth() + 1)}-${pad2(d.getUTCDate())}`;
-}
-function dayLabel(d, todayYMD) {
-  const ymd = toYMD(d);
-  if (ymd === todayYMD) return 'Сьогодні';
-  return `${RU_DAYS[d.getUTCDay()]} ${d.getUTCDate()} ${UA_MONTHS_SHORT[d.getUTCMonth()]}`;
-}
-
-/**
- * DST для Europe/Kiev:
- *   Летнее время действует с последнего воскресенья марта 03:00 до последнего воскресенья октября 04:00.
- *   Зимой offset +02:00, летом +03:00.
- */
-function lastSunday(year, monthIndex /* 0-based */) {
-  // Возвращает дату последнего воскресенья указанного месяца (UTC)
-  const d = new Date(Date.UTC(year, monthIndex + 1, 0)); // последний день месяца
-  const dow = d.getUTCDay(); // 0..6 (вс..сб)
-  const back = (dow + 7 - 0) % 7;
-  d.setUTCDate(d.getUTCDate() - back);
-  return d; // UTC дата-воскресенье
-}
-function isKievSummerTime(ymd /* 'YYYY-MM-DD' */) {
-  const [y, m, day] = ymd.split('-').map(Number);
-  const d = new Date(Date.UTC(y, m - 1, day, 12, 0, 0)); // середина дня, чтобы не попадать на край
-  const marchLastSun = lastSunday(y, 2);   // март
-  const octLastSun   = lastSunday(y, 9);   // октябрь
-
-  // Летнее время: от 03:00 последнего воскресенья марта до 04:00 последнего воскресенья октября
-  const start = new Date(Date.UTC(y, 2, marchLastSun.getUTCDate(), 0, 0, 0)); // сравниваем по дням
-  const end   = new Date(Date.UTC(y, 9, octLastSun.getUTCDate(), 0, 0, 0));
-
-  return d >= start && d < end; // в простом «по дням» сравнении достаточно
-}
-function offsetForKiev(ymd) {
-  return isKievSummerTime(ymd) ? '+03:00' : '+02:00';
-}
-function dayBoundsWithOffset(ymd, tz = TIMEZONE) {
-  // пока поддерживаем именно Europe/Kiev (или совместимые), при необходимости можно расширить
-  const off = tz === 'Europe/Kiev' ? offsetForKiev(ymd) : '+00:00';
-  return {
-    start: `${ymd}T00:00:00${off}`,
-    end:   `${ymd}T23:59:59${off}`,
+function resetFlow(ctx) {
+  ctx.session.flow = {
+    step: FLOW.IDLE,
+    serviceId: null,
+    serviceTitle: null,
+    sectorId: null,
+    sectorName: null,
+    date: null,
   };
 }
 
-// ------------ Telegram bot ------------
-const bot = new Telegraf(BOT_TOKEN);
-
-// простейшая «сессия» в памяти процесса
-const sessions = new Map(); // userId -> { serviceId, dateYMD, slotId, step, name, phone }
-
-bot.start(ctx =>
-  ctx.reply('Привіт! Оберіть дію:', Markup.keyboard([['🗂 Послуги']]).resize())
-);
-
-// список услуг
-bot.hears('🗂 Послуги', async (ctx) => {
-  try {
-    const services = await getServices();
-    if (!services.length) return ctx.reply('Послуг поки немає.');
-
-    const buttons = services.slice(0, 20).map(s => {
-      const id = s._id || s.id;
-      const name = s.info?.name || s.name || 'Без назви';
-      return [Markup.button.callback(name, `svc:${id}`)];
-    });
-    await ctx.reply('Оберіть послугу:', Markup.inlineKeyboard(buttons));
-  } catch (e) {
-    console.error('services error:', e?.response?.data || e?.message || e);
-    ctx.reply('Не вдалось отримати список послуг.');
-  }
+bot.start(async (ctx) => {
+  resetFlow(ctx);
+  await ctx.reply('Привіт! Оберіть дію:', mainMenu);
 });
 
-// выбор даты (7 дней)
-bot.action(/^svc:(.+)$/, async (ctx) => {
+bot.hears('📦 Послуги', async (ctx) => {
+  // Просто показать список услуг
+  const list = SERVICES.map(s => `• ${s.title} — ${s.id}`).join('\n');
+  await ctx.reply(`Доступні послуги:\n${list}\n\nНадішли /slots <SERVICE_ID> <YYYY-MM-DD> щоб побачити слоти на дату.`, mainMenu);
+});
+
+bot.hears('🗓️ Забронювати', async (ctx) => {
+  resetFlow(ctx);
+  ctx.session.flow.step = FLOW.PICK_SERVICE;
+
+  await ctx.reply(
+    'Оберіть тип послуги:',
+    Markup.inlineKeyboard(
+      SERVICES.map(s => [Markup.button.callback(s.title, `srv:${s.id}`)])
+    )
+  );
+});
+
+// Выбор услуги
+bot.action(/srv:(.+)/, async (ctx) => {
+  if (!ctx.session.flow || ctx.session.flow.step !== FLOW.PICK_SERVICE) return;
+  const serviceId = ctx.match[1];
+  const srv = SERVICES.find(s => s.id === serviceId);
+  ctx.session.flow.serviceId = serviceId;
+  ctx.session.flow.serviceTitle = srv?.title || 'Послуга';
+  ctx.session.flow.step = FLOW.PICK_SECTOR;
+
+  await ctx.answerCbQuery();
+  await ctx.editMessageText(`Послуга: ${ctx.session.flow.serviceTitle}\nШукаю доступні сектори…`);
+
   try {
-    const serviceId = ctx.match[1];
-    await ctx.answerCbQuery();
-
-    const today = new Date();
-    const todayYMD = toYMD(today);
-    const days = [...Array(7)].map((_, i) => {
-      const d = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate() + i));
-      return { ymd: toYMD(d), label: dayLabel(d, todayYMD) };
-    });
-
+    const sectors = await collectSectorsFromAvailability(serviceId);
+    if (!sectors.length) {
+      await ctx.reply('На найближчі 30 днів вільних секторів не знайдено. Спробуйте іншу дату/послугу.', mainMenu);
+      resetFlow(ctx);
+      return;
+    }
+    // Показать кнопки по 3 в ряд
     const rows = [];
-    for (let i = 0; i < days.length; i += 2) {
-      rows.push(days.slice(i, i + 2).map(x => Markup.button.callback(x.label, `day:${serviceId}:${x.ymd}`)));
+    for (let i = 0; i < sectors.length; i += 3) {
+      rows.push(sectors.slice(i, i+3).map(s => Markup.button.callback(s.name, `sec:${s.id}:${encodeURIComponent(s.name)}`)));
     }
-    rows.push([Markup.button.callback('↩️ Назад до послуг', 'back:services')]);
-
-    await ctx.editMessageText('Оберіть день:', Markup.inlineKeyboard(rows));
+    await ctx.reply('Оберіть сектор:', Markup.inlineKeyboard(rows));
   } catch (e) {
-    console.error('svc action error:', e?.message || e);
-    await ctx.reply('Сталася помилка. Спробуйте ще раз.');
+    console.error('collectSectors error', e);
+    await ctx.reply('Не вдалося отримати сектори. Спробуйте пізніше.', mainMenu);
+    resetFlow(ctx);
   }
 });
 
-bot.action('back:services', async (ctx) => {
-  return bot.hears.handlers.get('🗂 Послуги')[0](ctx);
+// Выбор сектора
+bot.action(/sec:([^:]+):(.+)/, async (ctx) => {
+  if (!ctx.session.flow || ctx.session.flow.step !== FLOW.PICK_SECTOR) return;
+  const sectorId = ctx.match[1];
+  const sectorName = decodeURIComponent(ctx.match[2]);
+
+  ctx.session.flow.sectorId = sectorId;
+  ctx.session.flow.sectorName = sectorName;
+  ctx.session.flow.step = FLOW.PICK_DATE;
+
+  await ctx.answerCbQuery();
+  await ctx.reply(
+    `Сектор: ${sectorName}\nВведіть дату у форматі YYYY-MM-DD або натисніть «До календаря».`,
+    Markup.keyboard([[Markup.button.text('📅 До календаря')]]).oneTime().resize()
+  );
 });
 
-// загрузка слотов выбранного дня
-bot.action(/^day:(.+):(\d{4}-\d{2}-\d{2})$/, async (ctx) => {
-  try {
-    const serviceId = ctx.match[1];
-    const ymd = ctx.match[2];
-    await ctx.answerCbQuery();
-
-    const { start, end } = dayBoundsWithOffset(ymd, TIMEZONE);
-
-    const j = await restQueryAvailability({ serviceId, startDate: start, endDate: end });
-    const slots = j?.slots || j?.availability?.slots || [];
-
-    if (!slots.length) {
-      return ctx.editMessageText('Немає доступних слотів на цю дату.', Markup.inlineKeyboard([
-        [Markup.button.callback('⬅️ До календаря', `svc:${serviceId}`)],
-      ]));
-    }
-
-    const btns = slots.slice(0, 12).map(s => {
-      const startT = (s.startTime || s.slot?.startTime || '').slice(11, 16);
-      const endT   = (s.endTime   || s.slot?.endTime   || '').slice(11, 16);
-      const slotId = s.slot?.id || s.id || s.slotId;
-      return [Markup.button.callback(`${startT} → ${endT}`, `pick:${serviceId}:${ymd}:${slotId}`)];
-    });
-
-    btns.push([Markup.button.callback('⬅️ До календаря', `svc:${serviceId}`)]);
-    await ctx.editMessageText(`Дата: ${ymd}\nОберіть час:`, Markup.inlineKeyboard(btns));
-  } catch (e) {
-    console.error('day action error:', e?.message || e);
-    await ctx.reply('Не вдалось отримати слоти на обрану дату.');
-  }
+// Поддержка «До календаря» — просто подсказка
+bot.hears('📅 До календаря', async (ctx) => {
+  if (!ctx.session.flow || ctx.session.flow.step !== FLOW.PICK_DATE) return;
+  await ctx.reply('Надішліть дату, наприклад: 2025-08-15');
 });
 
-// выбор слота -> имя/телефон -> createBooking
-bot.action(/^pick:(.+):(\d{4}-\d{2}-\d{2}):(.+)$/, async (ctx) => {
-  try {
-    const [_, serviceId, ymd, slotId] = ctx.match;
-    await ctx.answerCbQuery();
-    sessions.set(ctx.from.id, { serviceId, dateYMD: ymd, slotId, step: 'name' });
-    await ctx.reply('Введіть ваше імʼя:');
-  } catch (e) {
-    console.error('pick action error:', e);
-    await ctx.reply('Помилка вибору слоту.');
-  }
-});
-
+// Ввод даты текстом
 bot.on('text', async (ctx) => {
-  const s = sessions.get(ctx.from.id);
-  if (!s?.step) return;
+  // Обрабатываем только, если мы в шаге ввода даты
+  if (!ctx.session.flow || ctx.session.flow.step !== FLOW.PICK_DATE) {
+    return; // игнорируем лишние сообщения
+  }
+  const txt = (ctx.message.text || '').trim();
+  // Простой валидатор даты
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(txt)) {
+    await ctx.reply('Введіть дату у форматі YYYY-MM-DD, наприклад: 2025-08-15');
+    return;
+  }
+
+  ctx.session.flow.date = txt;
+  ctx.session.flow.step = FLOW.SHOW_TIMES;
+
+  const { serviceId, sectorId, sectorName } = ctx.session.flow;
+  await ctx.reply(`Шукаю вільні часи старту для ${sectorName} на ${txt}…`);
 
   try {
-    if (s.step === 'name') {
-      s.name = ctx.message.text.trim();
-      s.step = 'phone';
-      return ctx.reply('Введіть ваш номер телефону у форматі +380...');
+    const times = await daySlots({ serviceId, sectorId, dateStr: txt });
+    if (!times.length) {
+      await ctx.reply('Немає доступних слотів на цю дату. Оберіть іншу дату або сектор.', mainMenu);
+      resetFlow(ctx);
+      return;
     }
 
-    if (s.step === 'phone') {
-      const phone = ctx.message.text.trim();
-      if (!/^\+?\d{10,15}$/.test(phone)) {
-        return ctx.reply('Телефон має бути у форматі +380XXXXXXXXX (10–15 цифр).');
-      }
-      s.phone = phone;
-
-      const r = await wix.bookings.createBooking({
-        booking: {
-          slot: { slotId: s.slotId, serviceId: s.serviceId },
-          contactDetails: { fullName: s.name || ctx.from.first_name || 'Guest', phone: s.phone },
-          participants: 1,
-        },
-      });
-
-      const id = r?.booking?._id || r?.booking?.id || '—';
-      sessions.delete(ctx.from.id);
-      return ctx.reply(`✅ Бронювання створено!\nID: ${id}\nДата: ${s.dateYMD}`);
+    // Кнопки со временами (по 4 в ряд)
+    const rows = [];
+    for (let i = 0; i < times.length; i += 4) {
+      rows.push(times.slice(i, i+4).map(t => Markup.button.callback(t, `tm:${t}`)));
     }
+    await ctx.reply('Доступні часи початку:', Markup.inlineKeyboard(rows));
   } catch (e) {
-    console.error('booking error:', e?.response?.data || e);
-    sessions.delete(ctx.from.id);
-    return ctx.reply('Не вдалось створити бронь. Спробуйте інший слот.');
+    console.error('daySlots error', e);
+    await ctx.reply('Не вдалося отримати слоти. Спробуйте пізніше.', mainMenu);
+    resetFlow(ctx);
   }
 });
 
-// ------------ HTTP (health/debug) ------------
-app.get('/',        (_, res) => res.send('ok — /health, /debug/services, /debug/availability'));
-app.get('/health',  (_, res) => res.send('ok'));
-app.get('/debug/services', async (_, res) => {
+// Клик по времени — пока просто подтверждаем выбор
+bot.action(/tm:(.+)/, async (ctx) => {
+  if (!ctx.session.flow || ctx.session.flow.step !== FLOW.SHOW_TIMES) return;
+  const time = ctx.match[1];
+  const { serviceTitle, sectorName, date } = ctx.session.flow;
+
+  await ctx.answerCbQuery();
+  // Здесь можно продолжить: запросить контакт/ім’я, створити booking через Admin API.
+  await ctx.reply(
+    `Обрано:\n• Послуга: ${serviceTitle}\n• Сектор: ${sectorName}\n• Дата: ${date}\n• Час старту: ${time}\n\n(Далі — оформлення бронювання, додамо за потреби)`,
+    mainMenu
+  );
+  resetFlow(ctx);
+});
+
+// ==== Команда /slots (ручная проверка) ====
+bot.command('slots', async (ctx) => {
+  const parts = ctx.message.text.split(/\s+/);
+  // /slots <serviceId> [yyyy-mm-dd]
+  const serviceId = parts[1];
+  const date = parts[2] || new Date().toISOString().slice(0,10);
+
+  if (!serviceId) {
+    await ctx.reply('Використання: /slots <SERVICE_ID> [YYYY-MM-DD]');
+    return;
+  }
   try {
-    const items = await getServices();
-    res.json({ ok: true, count: items.length, items });
+    // соберём все секторы из ближайших 30 днів, і для вибраної дати покажемо, де є хоч один слот
+    const sectors = await collectSectorsFromAvailability(serviceId);
+    if (!sectors.length) {
+      await ctx.reply('Немає доступних секторів в найближчі 30 днів.');
+      return;
+    }
+
+    const findings = [];
+    for (const s of sectors) {
+      const times = await daySlots({ serviceId, sectorId: s.id, dateStr: date });
+      if (times.length) findings.push(`• ${s.name}: ${times.slice(0,8).join(', ')}${times.length>8?'…':''}`);
+    }
+    if (!findings.length) {
+      await ctx.reply(`Немає слотів на ${date}.`);
+      return;
+    }
+    await ctx.reply(`Вільні на ${date}:\n${findings.join('\n')}`);
   } catch (e) {
-    res.status(500).json({ ok: false, error: e?.response?.data || e?.message || e });
+    console.error('/slots error', e);
+    await ctx.reply('Помилка при отриманні слотів.');
   }
 });
 
-// /debug/availability?serviceId=<ID>&ymd=YYYY-MM-DD[&tz=Europe/Kiev]
+// ==== EXPRESS + WEBHOOK ====
+const app = express();
+app.use(express.json());
+
+// health
+app.get('/', (_req, res) => res.send('OK'));
+
+// debug endpoint: /debug/availability?serviceId=...&ymd=YYYY-MM-DD
 app.get('/debug/availability', async (req, res) => {
   try {
-    const { serviceId, ymd, tz } = req.query;
-    if (!serviceId || !ymd) return res.status(400).json({ ok: false, error: 'serviceId and ymd are required' });
-    const tzz = typeof tz === 'string' ? tz : TIMEZONE;
-    const { start, end } = dayBoundsWithOffset(String(ymd), tzz);
-    const j = await restQueryAvailability({ serviceId: String(serviceId), startDate: start, endDate: end });
-    res.json({ ok: true, timezone: tzz, start, end, raw: j });
+    const { serviceId, ymd, tz = 'Europe/Kiev', resourceId } = req.query;
+    if (!serviceId || !ymd) return res.json({ ok: false, error: 'need serviceId & ymd' });
+
+    const startISO = new Date(`${ymd}T00:00:00Z`).toISOString();
+    const endISO = new Date(`${ymd}T23:59:59Z`).toISOString();
+    const resourceIds = resourceId ? [String(resourceId)] : [];
+
+    const data = await queryAvailability({ serviceId, startISO, endISO, tz, resourceIds });
+    res.json({ ok: true, timezone: tz, start: startISO, end: endISO, raw: data });
   } catch (e) {
-    res.status(500).json({ ok: false, error: e?.response?.data || e?.message || e });
+    res.status(500).json({ ok: false, error: String(e) });
   }
 });
 
-// webhook для Telegram
-app.use(bot.webhookCallback(`/tg/${BOT_TOKEN}`));
+// Telegram webhook
+app.use(bot.webhookCallback('/tg/webhook'));
+await bot.telegram.setWebhook(`${PUBLIC_URL}/tg/webhook`);
 
-// ------------ START ------------
-app.listen(PORT, async () => {
-  try {
-    const url = `${PUBLIC_URL}/tg/${BOT_TOKEN}`;
-    await bot.telegram.setWebhook(url);
-    console.log('Webhook set to', url);
-  } catch (e) {
-    console.error('Webhook set error:', e?.response?.data || e);
-  }
-  console.log('Server listening on', PORT, 'TIMEZONE =', TIMEZONE);
+app.listen(PORT, () => {
+  console.log('Server listening on', PORT);
+  console.log('==> Your service is live 🎉');
+  console.log(`==> Available at your primary URL ${PUBLIC_URL}`);
+  console.log('==> ///////////////////////////////////////////////////////////////');
 });
