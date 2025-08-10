@@ -8,44 +8,31 @@ const app = express();
 app.use(express.json());
 
 // Константы из .env
-const TOKEN = process.env.BOT_TOKEN;   // токен бота
-const CHAT_ID = process.env.CHAT_ID;   // chat_id группы или канала
+const TOKEN = process.env.BOT_TOKEN;
+const CHAT_ID = process.env.CHAT_ID;
 
-// Прием данных брони
+// Приём данных от Wix
 app.post('/booking', async (req, res) => {
   try {
-    const { sector, date, time, amount, name, phone } = req.body;
+    console.log('📩 Получены данные от Wix:', JSON.stringify(req.body, null, 2));
 
-    if (!sector || !date || !amount || !name) {
-      return res.status(400).json({ ok: false, error: 'Не хватает данных' });
-    }
+    const rawData = JSON.stringify(req.body, null, 2);
 
-    const message = `
-📢 *Новая бронь!*
-━━━━━━━━━━━━━━
-🏝 Сектор: *${sector}*
-📅 Дата: *${date}*
-🕒 Время: *${time || '-'}*
-💰 Сумма: *${amount} грн*
-
-👤 Клиент: *${name}*
-📞 Телефон: [${phone || '-'}](tel:${phone || ''})
-    `;
-
-    // Отправляем сообщение в Telegram
+    // Отправляем сырые данные в Telegram
     await fetch(`https://api.telegram.org/bot${TOKEN}/sendMessage`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         chat_id: CHAT_ID,
-        text: message,
+        text: `📢 *Новая бронь (сырые данные)*\n\`\`\`json\n${rawData}\n\`\`\``,
         parse_mode: 'Markdown'
       })
     });
 
-    res.json({ ok: true, message: 'Отправлено в Telegram' });
+    // Отвечаем Wix, что запрос получен
+    res.json({ ok: true, received: req.body });
   } catch (err) {
-    console.error(err);
+    console.error('❌ Ошибка при обработке вебхука:', err);
     res.status(500).json({ ok: false, error: err.message });
   }
 });
