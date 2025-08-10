@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<title>Тест бронирования — Rybna Gavan</title>
+<style>
+    body { font-family: Arial, sans-serif; margin: 40px; background: #f4f4f4; }
+    h2 { color: #333; }
+    form { background: white; padding: 20px; border-radius: 10px; max-width: 400px; }
+    label { display: block; margin-top: 10px; }
+    input { width: 100%; padding: 8px; margin-top: 5px; }
+    button { margin-top: 15px; padding: 10px; width: 100%; background: #4CAF50; color: white; border: none; cursor: pointer; }
+    button:hover { background: #45a049; }
+</style>
+</head>
+<body>
+
+<h2>Отправка брони в Telegram</h2>
+<form id="bookingForm">
+    <label>Сектор:
+        <input type="text" name="sector" value="Сектор 1" required>
+    </label>
+    <label>Дата:
+        <input type="date" name="date" required>
+    </label>
+    <label>Время:
+        <input type="time" name="time">
+    </label>
+    <label>Сумма:
+        <input type="number" name="amount" value="800" required>
+    </label>
+    <label>Имя клиента:
+        <input type="text" name="name" value="Тестовый Клиент" required>
+    </label>
+    <label>Телефон:
+        <input type="tel" name="phone" value="+380631234567">
+    </label>
+    <button type="submit">Отправить бронь</button>
+</form>
+
+<script>
+document.getElementById('bookingForm').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const formData = Object.fromEntries(new FormData(e.target).entries());
+
+    try {
+        const res = await fetch("https://rybnagavan.onrender.com/booking", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(formData)
+        });
+
+        const json = await res.json();
+        alert("Ответ сервера: " + JSON.stringify(json));
+    } catch (err) {
+        alert("Ошибка: " + err);
+    }
+});
+</script>
+
+</body>
+</html>
