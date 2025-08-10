@@ -1,4 +1,4 @@
-// server.mjs — Telegram бот бронирования c календарём дат (Admin API Key)
+// server.mjs — Telegram бот для бронювання з календарем дат (Admin API Key)
 
 import 'dotenv/config';
 import express from 'express';
@@ -10,10 +10,11 @@ import { services as servicesApi, bookings as bookingsApi } from '@wix/bookings'
 const REQ_ENV = ['BOT_TOKEN', 'ADMIN_API_KEY', 'SITE_ID', 'PUBLIC_URL'];
 REQ_ENV.forEach(k => { if (!process.env[k]) console.error(`ENV ${k} is missing`); });
 
-const BOT_TOKEN = process.env.BOT_TOKEN;
+const BOT_TOKEN   = process.env.BOT_TOKEN;
 const ADMIN_API_KEY = process.env.ADMIN_API_KEY;
-const SITE_ID = process.env.SITE_ID;
-const PUBLIC_URL = process.env.PUBLIC_URL;
+const SITE_ID     = process.env.SITE_ID;
+const PUBLIC_URL  = process.env.PUBLIC_URL;
+const TIMEZONE    = process.env.TIMEZONE || 'Europe/Kyiv';
 
 const app = express();
 app.use(express.json());
@@ -31,70 +32,71 @@ const baseHeaders = {
   'wix-site-id': SITE_ID,
 };
 
+// Services — SDK → REST fallback
 async function restQueryServices() {
   const r = await fetch('https://www.wixapis.com/bookings/v1/services/query', {
-    method: 'POST', headers: baseHeaders, body: JSON.stringify({ query: {} }),
+    method: 'POST',
+    headers: baseHeaders,
+    body: JSON.stringify({ query: {} }),
   });
   if (!r.ok) throw new Error(`services ${r.status}: ${await r.text()}`);
   return r.json(); // { services: [...] }
 }
 
+// !!! FIX: filter всередині query
 async function restQueryAvailability({ serviceId, from, to }) {
   const r = await fetch('https://www.wixapis.com/bookings/v1/availability/query', {
-    method: 'POST', headers: baseHeaders,
-    body: JSON.stringify({ query: { serviceId, from, to } }),
+    method: 'POST',
+    headers: baseHeaders,
+    body: JSON.stringify({
+      query: {
+        filter: { serviceId },
+        from,
+        to,
+        timeZone: TIMEZONE, // не обовʼязково, але корисно
+      },
+    }),
   });
   if (!r.ok) throw new Error(`availability ${r.status}: ${await r.text()}`);
-  return r.json(); // { slots: [...] } (или availability.slots)
+  return r.json(); // { slots: [...] } (або availability.slots)
 }
 
-// объединённый геттер услуг (на будущее — если к SDK вернёмся)
 async function getServices() {
   try {
-    // попробуем SDK
     const resp = await wix.services.queryServices().find();
     return resp?.items ?? [];
-  } catch (_) {
-    // fallback REST
+  } catch {
     const j = await restQueryServices();
     return j?.services ?? j?.items ?? [];
   }
 }
 
-// ================== ДАТЫ/ФОРМАТЫ ==================
+// ================== ДАТИ/ФОРМАТИ ==================
 const RU_DAYS = ['Нд', 'Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб'];
 const UA_MONTHS_SHORT = ['січ', 'лют', 'бер', 'квіт', 'трав', 'черв', 'лип', 'сер', 'вер', 'жовт', 'лис', 'груд'];
 
 function pad2(n) { return n.toString().padStart(2, '0'); }
-
-function toYMD(d) {
-  // YYYY-MM-DD
-  return `${d.getUTCFullYear()}-${pad2(d.getUTCMonth() + 1)}-${pad2(d.getUTCDate())}`;
-}
-
+function toYMD(d) { return `${d.getUTCFullYear()}-${pad2(d.getUTCMonth() + 1)}-${pad2(d.getUTCDate())}`; }
 function dayLabel(d, todayYMD) {
   const ymd = toYMD(d);
   if (ymd === todayYMD) return 'Сьогодні';
   const wd = RU_DAYS[d.getUTCDay()];
-  const lab = `${wd} ${d.getUTCDate()} ${UA_MONTHS_SHORT[d.getUTCMonth()]}`;
-  return lab;
+  return `${wd} ${d.getUTCDate()} ${UA_MONTHS_SHORT[d.getUTCMonth()]}`;
 }
-
 function startOfUTC(ymd) { return new Date(`${ymd}T00:00:00.000Z`); }
 function endOfUTC(ymd)   { return new Date(`${ymd}T23:59:59.999Z`); }
 
 // ================== Telegram bot ==================
 const bot = new Telegraf(BOT_TOKEN);
 
-// простейшие "сессии" в памяти процесса
-const sessions = new Map(); // key: userId => { serviceId, dateYMD, slotId, step, name, phone }
+// Простенькі “сесії” в памʼяті процеса
+const sessions = new Map(); // userId => { serviceId, dateYMD, slotId, step, name, phone }
 
-// /start
 bot.start((ctx) =>
   ctx.reply('Привіт! Оберіть дію:', Markup.keyboard([['🗂 Послуги']]).resize())
 );
 
-// Послуги -> инлайн кнопки с услугами
+// Послуги -> інлайн кнопки
 bot.hears('🗂 Послуги', async (ctx) => {
   try {
     const services = await getServices();
@@ -112,13 +114,13 @@ bot.hears('🗂 Послуги', async (ctx) => {
   }
 });
 
-// При выборе услуги — показываем календарь на 7 дней
+// Обрали послугу — показуємо календар на 7 днів
 bot.action(/^svc:(.+)$/, async (ctx) => {
   try {
     const serviceId = ctx.match[1];
     await ctx.answerCbQuery();
 
-    const today = new Date(); // UTC ок, т.к. к Wix шлём ISO
+    const today = new Date();
     const todayYMD = toYMD(today);
 
     const days = [...Array(7)].map((_, i) => {
@@ -127,14 +129,9 @@ bot.action(/^svc:(.+)$/, async (ctx) => {
       return { ymd, label: dayLabel(d, todayYMD) };
     });
 
-    // делаем клавиатуру 2 колонки
     const rows = [];
     for (let i = 0; i < days.length; i += 2) {
-      const row = [];
-      for (let j = i; j < Math.min(i + 2, days.length); j++) {
-        row.push(Markup.button.callback(days[j].label, `day:${serviceId}:${days[j].ymd}`));
-      }
-      rows.push(row);
+      rows.push(days.slice(i, i + 2).map(x => Markup.button.callback(x.label, `day:${serviceId}:${x.ymd}`)));
     }
     rows.push([Markup.button.callback('↩️ Назад до послуг', 'back:services')]);
 
@@ -146,11 +143,11 @@ bot.action(/^svc:(.+)$/, async (ctx) => {
 });
 
 bot.action('back:services', async (ctx) => {
-  // заменим сообщение на список услуг
+  // повертаємося до списку послуг
   return bot.hears.handlers.get('🗂 Послуги')[0](ctx);
 });
 
-// Выбрали день — грузим слоты и показываем
+// Обрали день — тягнемо слоти
 bot.action(/^day:(.+):(\d{4}-\d{2}-\d{2})$/, async (ctx) => {
   try {
     const serviceId = ctx.match[1];
@@ -158,7 +155,7 @@ bot.action(/^day:(.+):(\d{4}-\d{2}-\d{2})$/, async (ctx) => {
     await ctx.answerCbQuery();
 
     const from = startOfUTC(ymd).toISOString();
-    const to = endOfUTC(ymd).toISOString();
+    const to   = endOfUTC(ymd).toISOString();
 
     const j = await restQueryAvailability({ serviceId, from, to });
     const slots = j?.slots || j?.availability?.slots || [];
@@ -184,7 +181,7 @@ bot.action(/^day:(.+):(\d{4}-\d{2}-\d{2})$/, async (ctx) => {
   }
 });
 
-// Выбрали слот — просим имя, потом телефон, потом создаём бронь
+// Обрали слот — просимо імʼя та телефон, потім бронюємо
 bot.action(/^pick:(.+):(\d{4}-\d{2}-\d{2}):(.+)$/, async (ctx) => {
   try {
     const [_, serviceId, ymd, slotId] = ctx.match;
@@ -215,7 +212,7 @@ bot.on('text', async (ctx) => {
       }
       s.phone = phone;
 
-      // создаём бронь (SDK)
+      // створюємо бронь (SDK)
       const r = await wix.bookings.createBooking({
         booking: {
           slot: { slotId: s.slotId, serviceId: s.serviceId },
@@ -235,8 +232,8 @@ bot.on('text', async (ctx) => {
   }
 });
 
-// ================== HTTP (диагностика) ==================
-app.get('/', (_, res) => res.send('ok — /health, /debug/services, використовуйте бота у Telegram'));
+// ================== HTTP (діагностика) ==================
+app.get('/', (_, res) => res.send('ok — /health, /debug/services'));
 app.get('/health', (_, res) => res.send('ok'));
 app.get('/debug/services', async (_, res) => {
   try {
