@@ -11,16 +11,14 @@ app.use(express.json());
 
 // === ENV ===
 const TOKEN = process.env.BOT_TOKEN;
-const CHAT  = process.env.CHAT_ID; // можно несколько через запятую
+const CHAT  = process.env.CHAT_ID;
 const TZ    = 'Europe/Kyiv';
 
-// опциональный фильтр статусов Wix
 const SEND_STATUSES = (process.env.SEND_STATUSES || 'APPROVED,CONFIRMED')
   .split(',')
   .map(s => s.trim().toUpperCase())
   .filter(Boolean);
 
-// антидубли
 const EVENT_TTL_MS = Number(process.env.EVENT_TTL_MS || 15 * 60 * 1000);
 const seen = new Map();
 setInterval(() => {
@@ -66,7 +64,7 @@ async function tg(method, payload) {
   return json.result;
 }
 
-async function sendBookingMessage(text) {
+async function sendBookingMessage(text, orderNo) {
   if (!TOKEN || !CHAT) throw new Error('BOT_TOKEN/CHAT_ID not set');
   const chats = String(CHAT).split(',').map(s => s.trim()).filter(Boolean);
   const results = [];
@@ -78,8 +76,8 @@ async function sendBookingMessage(text) {
       disable_web_page_preview: true,
       reply_markup: {
         inline_keyboard: [[
-          { text: '✅ Підтверджено', callback_data: 'approve' },
-          { text: '❌ Відхилено',   callback_data: 'reject'  }
+          { text: '✅ Підтверджено', callback_data: `approve:${orderNo || ''}` },
+          { text: '❌ Відхилено',   callback_data: `reject:${orderNo || ''}`  }
         ]]
       }
     });
@@ -106,7 +104,6 @@ function buildEventKey(req, data) {
   return 'hash:' + crypto.createHash('sha256').update(String(base)).digest('hex').slice(0, 32);
 }
 
-// Формат имени/пользователя, который нажал кнопку
 function formatActor(from = {}) {
   const nameParts = [from.first_name, from.last_name].filter(Boolean).join(' ').trim();
   if (nameParts && from.username) return `${nameParts} @${from.username}`;
@@ -167,12 +164,14 @@ app.post('/booking', async (req, res) => {
     const amountTotal = totalVal != null ? fmtMoney(totalVal, currency) : '';
     const amountDue   = fmtMoney(remainingVal, currency);
 
-    const name  = `${data.contact?.name?.first || ''} ${data.contact?.name?.last || ''}`.trim();
-    const phone = data.contact?.phones?.[0]?.e164Phone || data.booking_contact_phone || '';
+    const name    = `${data.contact?.name?.first || ''} ${data.contact?.name?.last || ''}`.trim();
+    const phone   = data.contact?.phones?.[0]?.e164Phone || data.booking_contact_phone || '';
+    const orderNo = data.order_number || '';
 
     const lines = [
       `📢 *Нове бронювання*`,
       `━━━━━━━━━━━━━━`,
+      orderNo ? `🧾 Номер замовлення: *${md(orderNo)}*` : null,
       service ? `🎣 Послуга: *${md(service)}*` : null,
       sector  ? `🏝 Сектор: *${md(sector)}*` : null,
       `📅 Початок: *${md(start)}*`,
@@ -184,7 +183,7 @@ app.post('/booking', async (req, res) => {
       phone ? `📞 Телефон: ${md(phone)}` : null
     ].filter(Boolean).join('\n');
 
-    await sendBookingMessage(lines);
+    await sendBookingMessage(lines, orderNo);
     res.status(200).json({ ok: true });
   } catch (e) {
     console.error('Помилка /booking:', e?.message || e);
@@ -201,7 +200,7 @@ app.post('/telegram', async (req, res) => {
     const cq     = update.callback_query;
     const chatId = cq.message?.chat?.id;
     const msgId  = cq.message?.message_id;
-    const data   = cq.data;
+    const [action, orderNo] = (cq.data || '').split(':'); // approve:123
 
     if (!chatId || !msgId) return res.sendStatus(200);
 
@@ -212,28 +211,26 @@ app.post('/telegram', async (req, res) => {
     }
     handledMessages.add(key);
 
-    // 1) удаляем клавиатуру
+    // убираем клавиатуру
     await tg('editMessageReplyMarkup', {
       chat_id: chatId,
       message_id: msgId,
       reply_markup: { inline_keyboard: [] }
     });
 
-    // 2) отдельным сообщением отправляем результат + кто нажал
+    // кто нажал
     const actor = formatActor(cq.from);
-    const resultLine = (data === 'approve')
-      ? `✅ Підтверджено (від ${actor})`
-      : `❌ Відхилено (від ${actor})`;
+    const resultLine = (action === 'approve')
+      ? `✅ Підтверджено (замовлення ${orderNo || '?'}, від ${actor})`
+      : `❌ Відхилено (замовлення ${orderNo || '?'}, від ${actor})`;
 
     await tg('sendMessage', {
       chat_id: chatId,
       text: resultLine,
       reply_to_message_id: msgId,
       allow_sending_without_reply: true
-      // без parse_mode — безопаснее
     });
 
-    // 3) отвечаем callback'у
     await tg('answerCallbackQuery', { callback_query_id: cq.id });
     res.sendStatus(200);
   } catch (e) {
