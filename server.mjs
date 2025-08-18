@@ -12,7 +12,7 @@ app.use(express.json());
 // === ENV ===
 const TOKEN = process.env.BOT_TOKEN;
 const CHAT  = process.env.CHAT_ID;
-const TZ    = 'Europe/Kyiv';
+const TZ    = 'Europe/Kiev';
 
 const SEND_STATUSES = (process.env.SEND_STATUSES || 'APPROVED,CONFIRMED')
   .split(',')
