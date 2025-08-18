@@ -9,18 +9,19 @@ dotenv.config();
 const app = express();
 app.use(express.json());
 
+// === ENV ===
 const TOKEN = process.env.BOT_TOKEN;                 // Telegram bot token
 const CHAT  = process.env.CHAT_ID;                   // Один или несколько chat_id через запятую
-const TZ    = 'Europe/Kiev';                         // корректная IANA TZ
+const TZ    = 'Europe/Kyiv';                         // корректная IANA TZ
 
-// Опциональный фильтр статусов: "APPROVED,CONFIRMED"
+// Опциональный фильтр статусов Wix: "APPROVED,CONFIRMED"
 // Пусто => не фильтруем
 const SEND_STATUSES = (process.env.SEND_STATUSES || 'APPROVED,CONFIRMED')
   .split(',')
   .map(s => s.trim().toUpperCase())
   .filter(Boolean);
 
-// Идемпотентность: TTL (по умолчанию 15 мин)
+// Идемпотентность для вебхуков Wix (TTL по умолчанию 15 мин)
 const EVENT_TTL_MS = Number(process.env.EVENT_TTL_MS || 15 * 60 * 1000);
 const seen = new Map(); // key -> expiresAt
 setInterval(() => {
@@ -28,11 +29,15 @@ setInterval(() => {
   for (const [k, exp] of seen) if (exp <= now) seen.delete(k);
 }, Math.min(EVENT_TTL_MS, 60_000)).unref();
 
+// Чтобы не принимать двойные нажатия на одну и ту же кнопку
+const handledMessages = new Set(); // `${chatId}:${messageId}`
+
+// === Utils ===
 function markSeen(key){ seen.set(key, Date.now() + EVENT_TTL_MS); }
 function isDuplicate(key){ return seen.has(key); }
 
-// MarkdownV2 escaping
 function md(text = '') {
+  // Экранируем MarkdownV2 спецсимволы
   return String(text).replace(/[_*[\]()~`>#+\-=|{}.!]/g, '\\$&');
 }
 
@@ -50,36 +55,46 @@ function fmtMoney(value, currency = 'UAH') {
   catch { return `${num} ${currency}`; }
 }
 
-async function sendToTelegram(text) {
-  if (!TOKEN || !CHAT) {
-    console.error('❌ Укажи BOT_TOKEN и CHAT_ID в .env');
-    return;
+async function tg(method, payload) {
+  const url = `https://api.telegram.org/bot${TOKEN}/${method}`;
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  });
+  const json = await res.json().catch(() => ({}));
+  if (!res.ok || !json.ok) {
+    throw new Error(`TG ${method} failed: ${res.status} ${json?.description || ''}`);
   }
-  const chats = String(CHAT).split(',').map(s => s.trim()).filter(Boolean);
-  for (const chatId of chats) {
-    try {
-      await fetch(`https://api.telegram.org/bot${TOKEN}/sendMessage`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          chat_id: chatId,
-          text,
-          parse_mode: 'MarkdownV2',
-          disable_web_page_preview: true
-        })
-      });
-    } catch (e) {
-      console.error(`Помилка надсилання в Telegram (chat ${chatId}):`, e?.message || e);
-    }
-  }
+  return json.result;
 }
 
-// Строим ключ идемпотентности для webhook
+async function sendBookingMessage(text) {
+  if (!TOKEN || !CHAT) throw new Error('BOT_TOKEN/CHAT_ID not set');
+  const chats = String(CHAT).split(',').map(s => s.trim()).filter(Boolean);
+  const results = [];
+  for (const chat_id of chats) {
+    const r = await tg('sendMessage', {
+      chat_id,
+      text,
+      parse_mode: 'MarkdownV2',
+      disable_web_page_preview: true,
+      reply_markup: {
+        inline_keyboard: [[
+          { text: '✅ Підтверджено', callback_data: 'approve' },
+          { text: '❌ Відхилено',   callback_data: 'reject'  }
+        ]]
+      }
+    });
+    results.push({ chat_id, message_id: r.message_id });
+  }
+  return results;
+}
+
 function buildEventKey(req, data) {
   const hdrId = req.headers['x-wix-event-id'] || req.headers['wix-event-id'];
   if (hdrId) return `hdr:${hdrId}`;
 
-  // Стабильные кандидаты из payload
   const base =
     data?.id ||
     data?.booking_id ||
@@ -98,32 +113,28 @@ function buildEventKey(req, data) {
   return 'hash:' + crypto.createHash('sha256').update(String(base)).digest('hex').slice(0, 32);
 }
 
-// Healthcheck
+// === Health ===
 app.get('/', (_req, res) => res.send('OK'));
 
-/**
- * Вебхук от Wix Bookings
- */
+// === Wix webhook: /booking ===
 app.post('/booking', async (req, res) => {
   try {
     const data = req.body?.data;
     const isWixBooking = data && (data.service_name || data.service_name_main_language);
     if (!isWixBooking) return res.status(200).json({ ok: true });
 
-    // ---- ИДЕМПОТЕНТНОСТЬ ----
+    // Идемпотентность
     const key = buildEventKey(req, data);
-    if (isDuplicate(key)) {
-      return res.status(200).json({ ok: true, dedup: true });
-    }
+    if (isDuplicate(key)) return res.status(200).json({ ok: true, dedup: true });
     markSeen(key);
 
-    // ---- ФИЛЬТР СТАТУСОВ (если задан) ----
+    // Фильтр статусов (опционально)
     const status = (data?.status || data?.booking_status || '').toString().toUpperCase();
     if (SEND_STATUSES.length && status && !SEND_STATUSES.includes(status)) {
       return res.status(200).json({ ok: true, skippedStatus: status });
     }
 
-    // --------- Поля ---------
+    // Поля
     const service = data.service_name_main_language || data.service_name || '';
     const sector  = data.staff_member_name || data.staff_member_name_main_language || '';
     const start   = fmtDate(data.start_date_by_business_tz || data.start_date);
@@ -135,19 +146,16 @@ app.post('/booking', async (req, res) => {
       data?.currency ||
       'UAH';
 
-    // Total
     let totalVal = null;
     if (data?.price?.value != null) totalVal = toNumber(data.price.value);
     else if (data?.total_amount?.value != null) totalVal = toNumber(data.total_amount.value);
     else if (data?.amount_due != null) totalVal = toNumber(data.amount_due); // fallback
 
-    // Paid
     const paidVal =
       data?.amount_paid?.value != null ? toNumber(data.amount_paid.value)
       : data?.paid_amount?.value != null ? toNumber(data.paid_amount.value)
       : 0;
 
-    // Remaining
     let remainingVal = 0;
     if (data?.remaining_amount_due?.value != null) {
       remainingVal = toNumber(data.remaining_amount_due.value);
@@ -161,7 +169,7 @@ app.post('/booking', async (req, res) => {
     const name  = `${data.contact?.name?.first || ''} ${data.contact?.name?.last || ''}`.trim();
     const phone = data.contact?.phones?.[0]?.e164Phone || data.booking_contact_phone || '';
 
-    // --------- Сообщение (укр., без ID/номеров) ---------
+    // Сообщение (укр., без ID)
     const lines = [
       `📢 *Нове бронювання*`,
       `━━━━━━━━━━━━━━`,
@@ -174,18 +182,69 @@ app.post('/booking', async (req, res) => {
       ``,
       name  ? `👤 Клієнт: *${md(name)}*` : null,
       phone ? `📞 Телефон: ${md(phone)}` : null
-      // ЖОДНИХ ID/номерів у повідомленні
     ].filter(Boolean).join('\n');
 
-    await sendToTelegram(lines);
+    await sendBookingMessage(lines);
     // Быстрый 200 — чтобы Wix не ретраил
     res.status(200).json({ ok: true });
   } catch (e) {
     console.error('Помилка /booking:', e?.message || e);
-    // Чтобы не спровоцировать ретраи Wix, лучше тоже 200
+    // Лучше не провоцировать ретраи Wix
     res.status(200).json({ ok: false, error: e?.message || 'unknown' });
   }
 });
 
+// === Telegram webhook: /telegram ===
+// Обрабатываем нажатия inline-кнопок: редактируем текст и убираем клавиатуру.
+app.post('/telegram', async (req, res) => {
+  try {
+    const update = req.body;
+    if (!update?.callback_query) return res.sendStatus(200);
+
+    const cq     = update.callback_query;
+    const chatId = cq.message?.chat?.id;
+    const msgId  = cq.message?.message_id;
+    const data   = cq.data; // 'approve' | 'reject'
+
+    if (!chatId || !msgId) return res.sendStatus(200);
+
+    const key = `${chatId}:${msgId}`;
+    if (handledMessages.has(key)) {
+      // Уже обработали нажатие — просто отвечаем callback
+      await tg('answerCallbackQuery', { callback_query_id: cq.id });
+      return res.sendStatus(200);
+    }
+    handledMessages.add(key);
+
+    const baseText = cq.message.text || '';
+    let newText = baseText + '\n\n';
+
+    if (data === 'approve') {
+      newText += '✅ *Підтверджено*';
+    } else {
+      newText += '❌ *Відхилено*';
+    }
+
+    // Редактируем сообщение (убираем клавиатуру)
+    await tg('editMessageText', {
+      chat_id: chatId,
+      message_id: msgId,
+      text: newText,
+      parse_mode: 'MarkdownV2',
+      disable_web_page_preview: true,
+      reply_markup: { inline_keyboard: [] } // клавиатуру удаляем
+    });
+
+    // Ответ на callback (чтобы "часики" исчезли)
+    await tg('answerCallbackQuery', { callback_query_id: cq.id });
+    res.sendStatus(200);
+  } catch (e) {
+    console.error('Помилка /telegram:', e?.message || e);
+    // Всё равно 200, чтобы Telegram не ретраил
+    res.sendStatus(200);
+  }
+});
+
+// === Start ===
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`✅ Server on ${PORT}`));
